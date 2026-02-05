@@ -1,0 +1,242 @@
+# DOCX to Markdown 使用指南
+
+## 目录
+
+1. [convert_docx.py 详解](#convert_docxpy-详解)
+2. [batch_convert.py 详解](#batch_convertpy-详解)
+3. [md_to_pdf.py 详解](#md_to_pdfpy-详解)
+4. [常见问题](#常见问题)
+5. [自定义扩展](#自定义扩展)
+
+---
+
+## convert_docx.py 详解
+
+### 核心功能
+
+将单个 DOCX 文档转换为 Markdown，同时提取图片和转换嵌入的 Excel 表格。
+
+### 命令行用法
+
+```bash
+python convert_docx.py <docx文件路径> <输出目录>
+```
+
+**示例：**
+```bash
+python convert_docx.py report.docx ./output
+```
+
+**输出（自动创建以文件名命名的子文件夹）：**
+```
+output/
+└── report/           # 自动创建的子文件夹
+    ├── report.md
+    └── assets/
+        ├── image1.png
+        ├── image2.jpeg
+        └── ...
+```
+
+### 核心函数
+
+#### `convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True)`
+
+主入口函数，执行完整的转换流程。
+
+**参数：**
+- `docx_path`: DOCX 文件路径
+- `output_dir`: 输出目录路径
+- `create_subfolder`: 是否在输出目录下创建以文件名命名的子文件夹（默认 True）
+
+**返回：** 生成的 Markdown 文件路径
+
+**输出结构：**
+- 当 `create_subfolder=True` 时：`output_dir/文件名/文件名.md` + `assets/`
+- 当 `create_subfolder=False` 时：`output_dir/文件名.md` + `assets/`
+
+#### `parse_relationships(docx_path)`
+
+解析 DOCX 内部的 XML 关系文件，识别 Excel 嵌入与预览图的映射关系。
+
+**返回：** 
+- `excel_to_preview`: Excel 文件 → 预览图文件 映射
+- `preview_to_excel`: 预览图文件 → Excel 文件 映射
+
+#### `excel_to_markdown(xlsx_data)`
+
+将 Excel 二进制数据转换为 Markdown 表格。
+
+**参数：** `xlsx_data` - Excel 文件的二进制内容
+
+**返回：** Markdown 表格字符串，失败返回 None
+
+#### `detect_image_format(image_data)`
+
+通过文件头检测图片真实格式。
+
+**支持格式：**
+- PNG (magic: `\x89PNG\r\n\x1a\n`)
+- JPEG (magic: `\xff\xd8`)
+- GIF (magic: `GIF87a` / `GIF89a`)
+- WEBP (magic: `RIFF...WEBP`)
+- BMP (magic: `BM`)
+
+#### `html_to_markdown(html)`
+
+将 HTML 转换为 Markdown，支持：
+
+| HTML 元素 | Markdown 输出 |
+|----------|--------------|
+| `<h1>-<h6>` | `#` - `######` |
+| `<strong>`, `<b>` | `**text**` |
+| `<em>`, `<i>` | `*text*` |
+| `<img>` | `![](path)` |
+| `<a>` | `[text](url)` |
+| `<ul>/<li>` | `- item` |
+| `<table>` | Markdown 表格 |
+
+---
+
+## batch_convert.py 详解
+
+### 核心功能
+
+批量转换目录下所有 DOCX 文件，每个文件生成独立的输出文件夹。
+
+### 命令行用法
+
+```bash
+python batch_convert.py [源目录] [输出目录]
+```
+
+**默认值：**
+- 源目录: `1-Reference`
+- 输出目录: `2-Temp`
+
+**示例：**
+```bash
+python batch_convert.py ./documents ./markdown_output
+```
+
+### 特性
+
+1. **自动跳过** - 已存在的输出目录会被跳过
+2. **进度显示** - 显示 `[当前/总数]` 进度
+3. **统计汇总** - 结束时显示成功/失败数量
+4. **文件名清理** - 自动移除特殊引号字符
+
+### 输出结构
+
+```
+output_dir/
+├── Document1/
+│   ├── Document1.md
+│   └── assets/
+├── Document2/
+│   ├── Document2.md
+│   └── assets/
+└── ...
+```
+
+---
+
+## md_to_pdf.py 详解
+
+### 核心功能
+
+将 Markdown 文件转换为 PDF，支持中文字体。
+
+### 配置
+
+编辑脚本中的路径变量：
+
+```python
+input_file = '3-Results/document.md'
+output_file = '3-Results/document.pdf'
+```
+
+### 中文字体支持
+
+自动检测系统字体：
+
+| 系统 | 字体路径 |
+|-----|---------|
+| macOS | `/System/Library/Fonts/PingFang.ttc` |
+| Linux | `/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf` |
+| Windows | `C:/Windows/Fonts/msyh.ttc` |
+
+### 样式配置
+
+| 元素 | 字体大小 | 颜色 |
+|-----|---------|-----|
+| 标题 (H1) | 18pt | #1a5490 |
+| 标题 (H2) | 14pt | #1a5490 |
+| 标题 (H3) | 12pt | #2c3e50 |
+| 正文 | 10pt | 黑色 |
+| 列表 | 10pt | 黑色，缩进 20pt |
+
+### 页面设置
+
+- 纸张: A4
+- 页边距: 2cm (上下左右)
+
+---
+
+## 常见问题
+
+### Q: 图片没有正确提取？
+
+检查 DOCX 文件结构，确保图片在 `word/media/` 目录下。某些第三方工具生成的 DOCX 可能有不同结构。
+
+### Q: Excel 表格没有转换？
+
+确认：
+1. Excel 是嵌入对象（不是链接）
+2. 安装了 `pandas` 和 `openpyxl`
+
+### Q: PDF 中文显示为方块？
+
+确保系统有支持的中文字体，或在 `font_paths` 列表中添加自定义字体路径。
+
+### Q: 批量转换时某些文件失败？
+
+查看控制台输出的错误信息，常见原因：
+- 文件损坏
+- 密码保护
+- 非标准 DOCX 格式
+
+---
+
+## 自定义扩展
+
+### 添加新的图片格式支持
+
+在 `detect_image_format()` 中添加新的 magic bytes 检测：
+
+```python
+elif image_data[:4] == b'新格式magic':
+    return '.新扩展名'
+```
+
+### 自定义 HTML 转 Markdown 规则
+
+在 `html_to_markdown()` 中添加新的正则替换：
+
+```python
+html = re.sub(r'<custom>(.*?)</custom>', r'自定义格式\1', html, flags=re.DOTALL)
+```
+
+### 添加新的 PDF 样式
+
+在 `md_to_pdf.py` 中创建新的 `ParagraphStyle`：
+
+```python
+custom_style = ParagraphStyle(
+    'CustomStyle',
+    parent=styles['Normal'],
+    fontName=chinese_font,
+    fontSize=12,
+    textColor=colors.HexColor('#颜色'),
+)
+```
