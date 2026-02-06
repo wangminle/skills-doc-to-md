@@ -19,12 +19,12 @@
 ### 命令行用法
 
 ```bash
-python convert_docx.py <docx文件路径> <输出目录>
+python scripts/convert_docx.py <docx文件路径> <输出目录>
 ```
 
 **示例：**
 ```bash
-python convert_docx.py report.docx ./output
+python scripts/convert_docx.py report.docx ./output
 ```
 
 **输出（自动创建以文件名命名的子文件夹）：**
@@ -57,15 +57,22 @@ output/
 
 #### `parse_relationships(docx_path)`
 
-解析 DOCX 内部的 XML 关系文件，识别 Excel 嵌入与预览图的映射关系。
+解析 DOCX 内部的关系文件，识别 Excel 嵌入与预览图的映射关系。
 
-**返回：** 
+**策略（双重保险）：**
+1. **优先**：解析 `document.xml` 中的 `<w:object>` 节点，从 `<o:OLEObject>` 和 `<v:imagedata>` 提取真实的 rId 配对（可靠，不依赖 ID 排列顺序）
+2. **补全**：对方法 1 未覆盖的 Excel 项，使用 rId 相邻启发式补全映射（兼容非标准生成器）
+
+**返回：** `(excel_to_preview, preview_to_excel, ordered_pairs)` 三元组
 - `excel_to_preview`: Excel 文件 → 预览图文件 映射
 - `preview_to_excel`: 预览图文件 → Excel 文件 映射
+- `ordered_pairs`: `[(Excel路径, 预览图路径), ...]`，按文档出现顺序排列（用于队列消费）
 
 #### `excel_to_markdown(xlsx_data)`
 
-将 Excel 二进制数据转换为 Markdown 表格。
+将 Excel 二进制数据转换为 Markdown 表格（仅依赖 openpyxl，无需 pandas）。
+
+自动清理全空行和全空列，补齐短行。
 
 **参数：** `xlsx_data` - Excel 文件的二进制内容
 
@@ -107,7 +114,7 @@ output/
 ### 命令行用法
 
 ```bash
-python batch_convert.py [源目录] [输出目录]
+python scripts/batch_convert.py [源目录] [输出目录]
 ```
 
 **默认值：**
@@ -116,7 +123,7 @@ python batch_convert.py [源目录] [输出目录]
 
 **示例：**
 ```bash
-python batch_convert.py ./documents ./markdown_output
+python scripts/batch_convert.py ./documents ./markdown_output
 ```
 
 ### 特性
@@ -124,7 +131,7 @@ python batch_convert.py ./documents ./markdown_output
 1. **自动跳过** - 已存在的输出目录会被跳过
 2. **进度显示** - 显示 `[当前/总数]` 进度
 3. **统计汇总** - 结束时显示成功/失败数量
-4. **文件名清理** - 自动移除特殊引号字符
+4. **文件名清理与防冲突** - 自动清理非法字符；超长文件名会附加短 hash
 
 ### 输出结构
 
@@ -141,20 +148,45 @@ output_dir/
 
 ---
 
-## md_to_pdf.py 详解
+## md_to_pdf.py 详解（可选功能）
+
+> **独立运行**：该脚本可独立于本 skill 使用。
+> **推荐模式**：若系统已安装 pandoc，优先走 pandoc 引擎，效果通常更好。
 
 ### 核心功能
 
 将 Markdown 文件转换为 PDF，支持中文字体。
 
-### 配置
+### 命令行用法
 
-编辑脚本中的路径变量：
-
-```python
-input_file = '3-Results/document.md'
-output_file = '3-Results/document.pdf'
+```bash
+python scripts/md_to_pdf.py <markdown文件路径> [pdf输出路径] [--engine auto|pandoc|python]
 ```
+
+**示例：**
+```bash
+python scripts/md_to_pdf.py document.md                           # 默认 auto（优先 pandoc）
+python scripts/md_to_pdf.py document.md output.pdf --engine auto
+python scripts/md_to_pdf.py document.md output.pdf --engine pandoc
+python scripts/md_to_pdf.py document.md output.pdf --engine python
+```
+
+### 核心函数
+
+#### `convert_md_to_pdf(input_file, output_file=None)`
+
+**参数：**
+- `input_file`: Markdown 文件路径
+- `output_file`: PDF 输出路径（可选，默认为输入文件同目录下同名 .pdf 文件）
+
+**返回：** 生成的 PDF 文件路径字符串，失败抛出异常
+
+#### `run_conversion(input_file, output_file, engine)`
+
+**引擎策略：**
+1. `auto`：先尝试 `pandoc`，不可用则回退 Python 渲染
+2. `pandoc`：强制使用 pandoc
+3. `python`：强制使用 Python 渲染（需安装 `markdown` + `reportlab`）
 
 ### 中文字体支持
 
@@ -165,6 +197,8 @@ output_file = '3-Results/document.pdf'
 | macOS | `/System/Library/Fonts/PingFang.ttc` |
 | Linux | `/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf` |
 | Windows | `C:/Windows/Fonts/msyh.ttc` |
+
+如果系统字体无法注册，会自动回退到 ReportLab 内置的 CID 字体（如 `STSong-Light`）。
 
 ### 样式配置
 
@@ -193,11 +227,20 @@ output_file = '3-Results/document.pdf'
 
 确认：
 1. Excel 是嵌入对象（不是链接）
-2. 安装了 `pandas` 和 `openpyxl`
+2. 安装了 `openpyxl`（`requirements.txt` 已包含）
+3. 如果文档由 WPS/LibreOffice 等非 Microsoft Office 生成，OLE 引用结构可能不同，脚本会自动用启发式补全
+
+### Q: 同一个表格预览图在文档里出现多次，会不会后面失效？
+
+不会。脚本使用“队列 + 重复兜底”策略处理占位替换，同一预览图重复出现时会持续替换为表格，不会退化成普通图片。
+
+### Q: 图片提取时会不会因为扩展名修正而覆盖同名文件？
+
+默认不会。若修正扩展名后发生重名且内容不同，脚本会自动追加短 hash 后缀（如 `_a1b2c3d4`）避免覆盖。
 
 ### Q: PDF 中文显示为方块？
 
-确保系统有支持的中文字体，或在 `font_paths` 列表中添加自定义字体路径。
+确保系统有支持的中文字体。脚本会依次尝试系统字体并回退到 ReportLab 内置 CID 字体（如 `STSong-Light`）。
 
 ### Q: 批量转换时某些文件失败？
 

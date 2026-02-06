@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-批量将1-Reference目录下的所有docx文档转换为markdown格式
+批量将目录下的所有docx文档转换为markdown格式
 每个文档生成一个同名文件夹，包含md文件和assets子文件夹
 """
 
 import os
 import sys
 import glob
-from convert_docx import convert_docx_to_markdown
+
+# 支持从同目录或作为模块导入
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
+from convert_docx import convert_docx_to_markdown, sanitize_stem
 
 def batch_convert(source_dir, output_dir):
     """批量转换目录下的所有docx文件"""
     
     # 获取所有docx文件
-    docx_files = glob.glob(os.path.join(source_dir, '*.docx'))
+    docx_files = glob.glob(os.path.join(source_dir, '*.docx')) + glob.glob(os.path.join(source_dir, '*.DOCX'))
     
     if not docx_files:
         print(f"在 {source_dir} 中没有找到docx文件")
@@ -23,12 +29,13 @@ def batch_convert(source_dir, output_dir):
     
     success_count = 0
     fail_count = 0
+
+    os.makedirs(output_dir, exist_ok=True)
     
     for i, docx_path in enumerate(sorted(docx_files), 1):
         # 获取文件名（不含扩展名）作为输出文件夹名
         base_name = os.path.splitext(os.path.basename(docx_path))[0]
-        # 移除文件名中的特殊引号，保持文件夹名称简洁
-        folder_name = base_name.replace('"', '').replace('"', '').replace('"', '')
+        folder_name = sanitize_stem(base_name)
         target_dir = os.path.join(output_dir, folder_name)
         
         print(f"[{i}/{len(docx_files)}] 正在处理: {base_name}")
@@ -40,7 +47,6 @@ def batch_convert(source_dir, output_dir):
             continue
         
         try:
-            # 使用 create_subfolder=False，因为我们已经计算好了目标目录
             convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True)
             print(f"  ✅ 完成\n")
             success_count += 1
