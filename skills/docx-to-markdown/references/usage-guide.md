@@ -51,6 +51,9 @@ output/
 
 **返回：** 生成的 Markdown 文件路径
 
+**异常：**
+- 当输入文件不是有效 DOCX/ZIP，或缺少 `word/document.xml` 时抛出 `ValueError`
+
 **输出结构：**
 - 当 `create_subfolder=True` 时：`output_dir/文件名/文件名.md` + `assets/`
 - 当 `create_subfolder=False` 时：`output_dir/文件名.md` + `assets/`
@@ -89,7 +92,7 @@ output/
 - WEBP (magic: `RIFF...WEBP`)
 - BMP (magic: `BM`)
 
-#### `html_to_markdown(html)`
+#### `html_to_markdown(html, heading_level_map=None)`
 
 将 HTML 转换为 Markdown，支持：
 
@@ -102,6 +105,10 @@ output/
 | `<a>` | `[text](url)` |
 | `<ul>/<li>` | `- item` |
 | `<table>` | Markdown 表格 |
+
+补充说明：
+- `heading_level_map`（可选）用于按 DOCX 原始 heading 样式覆盖标题层级
+- `<img src=...>` 支持双引号、单引号、无引号三种写法
 
 ---
 

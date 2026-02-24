@@ -13,8 +13,10 @@
 ## 功能
 
 - `.docx → .md`：保留常见标题、段落、列表、链接、表格
+- 标题还原增强：优先使用 DOCX `heading_*` 样式映射标题层级，并对重复重置的编号小节做局部重排
 - 图片提取：输出到 `assets/`，Markdown 使用相对路径引用
 - 嵌入 Excel：将嵌入的 `.xlsx` 转为 Markdown 表格
+- 合并单元格语义展开：将 Excel 合并格展开为 Markdown 管道表的显式网格值
 - 批处理：批量转换目录下多个 DOCX
 - `.md → .pdf`（可选）：独立脚本，优先走 pandoc，支持中文字体回退
 - 文件名稳健：自动清理非法字符；超长文件名会附加短 hash，避免不同文件名截断后冲突
@@ -65,8 +67,16 @@ output_dir/
 ## 注意事项
 
 - "嵌入 Excel → Markdown 表格"使用双策略：优先解析 `document.xml` OLE 引用，再对未覆盖项使用 rId 相邻启发式补全。不同 Office/WPS 生成的文档可能存在差异。
+- Excel 合并单元格在 Markdown 中采用“全展开”语义（便于程序与 LLM 读取）：
+  - 纵向单列合并（`rowspan`）: 用左上角锚点值向下填充每一行
+  - 横向单行合并（`colspan`）: 用左上角锚点值向右填充每一列
+  - `n x m` 矩形合并: 用左上角锚点值填满整个矩形区域
+- 对包含合并单元格的 Excel 表格，Markdown 表格上方会追加引用说明：
+  - `> merge_ranges: A1:B2, C3:C5, ...`
+  - 用于保留原始合并范围信息，便于程序/LLM 做语义还原
 - 当同一预览图在文档中重复出现时，脚本会优先持续替换为表格；不会因为队列耗尽退化为普通图片。
 - 修正图片扩展名后若发生重名冲突，脚本会自动追加 hash 后缀，避免覆盖已提取文件。
+- 输入文件若不是有效 DOCX/ZIP（或缺少 `word/document.xml`），会抛出明确错误信息。
 - 如果只需要简单的 DOCX 转 MD（无嵌入 Excel），推荐直接使用 `pandoc --extract-media ./media input.docx -o output.md`。
 
 ## License

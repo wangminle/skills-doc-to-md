@@ -71,6 +71,11 @@ If output path is omitted, PDF is saved in the same directory as the input file.
 
 ## Key Features
 
+### Heading Restoration
+
+- Prefer DOCX `heading_*` bookmarks + paragraph style mapping to recover Markdown heading levels
+- Renumber repeated reset-style numbered subheadings (for example multiple `1.` / `1.1` restarts) within local section scope
+
 ### Embedded Excel Conversion
 
 Automatically detects Excel spreadsheets embedded in DOCX and converts them to Markdown tables:
@@ -79,6 +84,13 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 - Uses relationship ID adjacency heuristic to supplement mappings not covered by OLE parsing
 - Extracts Excel data using openpyxl (lightweight, no pandas needed)
 - Replaces preview images with formatted Markdown tables, with repeat-safe placeholder handling
+- Expands merged cells to explicit Markdown grid values for parser/LLM-friendly output:
+  - Vertical single-column merge (`rowspan`) → fill down all rows with anchor value
+  - Horizontal single-row merge (`colspan`) → fill right all columns with anchor value
+  - `n x m` rectangular merge → fill the entire merged rectangle with anchor value
+- Adds a blockquote note above each merged-table:
+  - `> merge_ranges: A1:B2, C3:C5, ...`
+  - Preserves original merge scope metadata for downstream parsers
 
 ### Image Handling
 

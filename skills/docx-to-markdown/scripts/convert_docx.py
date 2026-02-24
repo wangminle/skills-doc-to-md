@@ -16,7 +16,7 @@ from html import unescape
 from html.parser import HTMLParser
 from collections import defaultdict
 import posixpath
-from typing import List
+from typing import Dict, List, Optional
 
 
 _FORBIDDEN_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
@@ -197,7 +197,8 @@ class _ListHTMLTransformer(HTMLParser):
                     self._li_stack[-1].append("\n")
                 self._li_stack[-1].append(md)
             else:
-                self._out.append("\n" + md + "\n")
+                # 顶层列表后补空行，避免后续表格被当作列表延续文本。
+                self._out.append("\n" + md + "\n\n")
             return
 
         if tag == "li" and self._li_stack:
@@ -360,7 +361,71 @@ def promote_numbered_bold_headings(markdown: str) -> str:
         previous_heading_level = level
         previous_promoted_depth = depth
 
-    return "\n".join(out)
+    # 一些 DOCX 会被导出成多个独立的 `<ol><li>`，导致“1.”在同一章节内反复重置。
+    # 这里按“标题层级 + 上级章节 + 当前粗体分节标记”做局部重排，仅修正重复的 1.x 小节。
+    renumbered = []
+    heading_stack = {}
+    heading_node_stack = {}
+    heading_node_seq = 0
+    counters = {}
+    current_bold_section = ""
+    heading_re = re.compile(
+        r"^(?P<hash>#{1,6})\s+(?P<num>\d+(?:\.\d+)*)(?P<dot>\.)?\s+(?P<title>.+)$"
+    )
+    any_heading_re = re.compile(r"^(?P<hash>#{1,6})\s+(?P<title>.+)$")
+    bold_section_re = re.compile(r"^\*\*[^*\n]+\*\*$")
+
+    for line in out:
+        stripped = line.strip()
+        if bold_section_re.match(stripped):
+            current_bold_section = stripped
+            renumbered.append(line)
+            continue
+
+        match = heading_re.match(line)
+        if match:
+            level = len(match.group("hash"))
+            num_text = match.group("num")
+            dot = match.group("dot") or ""
+            title = match.group("title")
+            parts = num_text.split(".")
+            last_num = int(parts[-1])
+            prefix = tuple(parts[:-1])
+            parent_nodes = tuple(heading_node_stack.get(i, 0) for i in range(1, level))
+            key = (level, parent_nodes, current_bold_section, prefix)
+            if last_num == 1:
+                last_num = counters.get(key, 0) + 1
+            counters[key] = last_num
+            new_num_text = ".".join([*prefix, str(last_num)]) if prefix else str(last_num)
+
+            for lvl in list(heading_stack.keys()):
+                if lvl >= level:
+                    heading_stack.pop(lvl, None)
+                    heading_node_stack.pop(lvl, None)
+
+            heading_stack[level] = f"{new_num_text}{dot} {title}".strip()
+            heading_node_seq += 1
+            heading_node_stack[level] = heading_node_seq
+            renumbered.append(f"{match.group('hash')} {new_num_text}{dot} {title}")
+            continue
+
+        heading_match = any_heading_re.match(line)
+        if heading_match:
+            level = len(heading_match.group("hash"))
+            for lvl in list(heading_stack.keys()):
+                if lvl >= level:
+                    heading_stack.pop(lvl, None)
+                    heading_node_stack.pop(lvl, None)
+            heading_stack[level] = heading_match.group("title").strip()
+            heading_node_seq += 1
+            heading_node_stack[level] = heading_node_seq
+            current_bold_section = ""
+            renumbered.append(line)
+            continue
+
+        renumbered.append(line)
+
+    return "\n".join(renumbered)
 
 
 def sanitize_stem(stem: str) -> str:
@@ -378,6 +443,68 @@ def sanitize_stem(stem: str) -> str:
     # 截断时附加原始全名的短 hash，避免不同长文件名映射到同一输出目录
     suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"{stem[:111]}_{suffix}"
+
+
+def extract_heading_level_map(docx_path: str) -> Dict[str, int]:
+    """解析 DOCX 的 heading bookmark 段落样式，映射为 Markdown 标题层级。"""
+    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    tag_p = f"{{{ns_w}}}p"
+    tag_ppr = f"{{{ns_w}}}pPr"
+    tag_pstyle = f"{{{ns_w}}}pStyle"
+    tag_bm = f"{{{ns_w}}}bookmarkStart"
+    attr_name = f"{{{ns_w}}}name"
+    attr_val = f"{{{ns_w}}}val"
+    tag_t = f"{{{ns_w}}}t"
+
+    def style_to_level(style_val: str) -> Optional[int]:
+        if not style_val:
+            return None
+        raw = str(style_val).strip()
+        m = re.search(r"(\d+)$", raw)
+        if not m:
+            return None
+        n = int(m.group(1))
+        if n <= 0:
+            return None
+        # style=1/2/3 对应二/三/四级标题，保留历史输出约定（# 留给文档总标题）。
+        return min(n + 1, 6)
+
+    def infer_level_from_text(text: str) -> Optional[int]:
+        m = re.match(r"^\s*(\d+(?:\.\d+)*)\s*\.?\s+", text or "")
+        if not m:
+            return None
+        depth = m.group(1).count(".") + 1
+        return min(depth + 1, 6)
+
+    level_map: Dict[str, int] = {}
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zip_ref:
+            doc_xml = ET.fromstring(zip_ref.read("word/document.xml"))
+        for p in doc_xml.findall(f".//{tag_p}"):
+            bm = p.find(f".//{tag_bm}")
+            if bm is None:
+                continue
+            name = bm.get(attr_name)
+            if not name or not name.startswith("heading_"):
+                continue
+
+            ppr = p.find(tag_ppr)
+            style_val = ""
+            if ppr is not None:
+                pstyle = ppr.find(tag_pstyle)
+                if pstyle is not None:
+                    style_val = pstyle.get(attr_val, "")
+
+            level = style_to_level(style_val)
+            if level is None:
+                text = "".join((t.text or "") for t in p.findall(f".//{tag_t}"))
+                level = infer_level_from_text(text)
+            if level is not None:
+                level_map[name] = level
+    except Exception:
+        return {}
+
+    return level_map
 
 
 def resolve_part_path(target: str) -> str:
@@ -499,19 +626,14 @@ def excel_to_markdown(xlsx_data):
                 return []
             return [[r[j] for j in non_empty_cols] for r in rows]
 
-        def apply_vertical_merges(ws, raw_rows: List[List[str]]) -> List[List[str]]:
-            """将单列纵向合并单元格展开为每一行都带值。"""
+        def apply_merged_cells(ws, raw_rows: List[List[str]]) -> List[List[str]]:
+            """将合并单元格展开为 Markdown 管道表可读的全展开网格。"""
             if not raw_rows:
                 return raw_rows
 
             for merged in ws.merged_cells.ranges:
                 min_row, max_row = merged.min_row, merged.max_row
                 min_col, max_col = merged.min_col, merged.max_col
-                if max_row <= min_row:
-                    continue
-                # 仅展开单列纵向合并；横向合并在 Markdown 管道表中保持空白。
-                if min_col != max_col:
-                    continue
 
                 row_idx = min_row - 1
                 col_idx = min_col - 1
@@ -528,32 +650,37 @@ def excel_to_markdown(xlsx_data):
                     i = row_no - 1
                     if i >= len(raw_rows):
                         continue
-                    if col_idx >= len(raw_rows[i]):
-                        raw_rows[i].extend([''] * (col_idx + 1 - len(raw_rows[i])))
-                    raw_rows[i][col_idx] = anchor_value
+                    if len(raw_rows[i]) < max_col:
+                        raw_rows[i].extend([''] * (max_col - len(raw_rows[i])))
+                    for col_no in range(min_col, max_col + 1):
+                        raw_rows[i][col_no - 1] = anchor_value
             return raw_rows
 
-        def sheet_to_rows(ws) -> List[List[str]]:
+        def sheet_to_rows(ws) -> tuple[List[List[str]], List[str], int]:
             raw_rows: List[List[str]] = []
             for row in ws.iter_rows(values_only=True):
                 raw_rows.append([
                     _normalize_markdown_cell_text(str(cell)) if cell is not None else ''
                     for cell in row
                 ])
-            raw_rows = apply_vertical_merges(ws, raw_rows)
-            return normalize_rows(raw_rows)
+            score_rows = normalize_rows(raw_rows)
+            score = sum(1 for r in score_rows for c in r if c.strip())
+            merge_ranges = [str(rng) for rng in ws.merged_cells.ranges]
+            raw_rows = apply_merged_cells(ws, raw_rows)
+            return normalize_rows(raw_rows), merge_ranges, score
 
         # 不使用 read_only=True：部分嵌入工作簿的维度元数据异常，read_only 模式会把表格截断成 1x1。
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_data), read_only=False, data_only=True)
         best_rows = []
+        best_merge_ranges: List[str] = []
         best_score = -1
         for ws in wb.worksheets:
-            rows = sheet_to_rows(ws)
+            rows, merge_ranges, score = sheet_to_rows(ws)
             if not rows:
                 continue
-            score = sum(1 for r in rows for c in r if c.strip())
             if score > best_score:
                 best_rows = rows
+                best_merge_ranges = merge_ranges
                 best_score = score
         wb.close()
 
@@ -563,7 +690,11 @@ def excel_to_markdown(xlsx_data):
         header = '| ' + ' | '.join(best_rows[0]) + ' |'
         separator = '| ' + ' | '.join(['---'] * len(best_rows[0])) + ' |'
         body_lines = ['| ' + ' | '.join(r) + ' |' for r in best_rows[1:]]
-        return header + '\n' + separator + '\n' + '\n'.join(body_lines)
+        table_text = header + '\n' + separator + '\n' + '\n'.join(body_lines)
+        if best_merge_ranges:
+            ranges_text = ", ".join(best_merge_ranges)
+            return f"> merge_ranges: {ranges_text}\n\n{table_text}"
+        return table_text
 
     except Exception as e:
         print(f"    Excel转Markdown失败: {e}")
@@ -682,6 +813,14 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
         create_subfolder: 是否在输出目录下创建以文件名命名的子文件夹（默认 True）
     """
     
+    # 先校验输入，避免 BadZipFile 直接中断并泄漏底层异常。
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zip_ref:
+            if "word/document.xml" not in zip_ref.namelist():
+                raise ValueError(f"输入文件不是有效的 DOCX（缺少 word/document.xml）: {docx_path}")
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"输入文件不是有效的 DOCX/ZIP: {docx_path}") from exc
+
     # 获取文件名（不含扩展名）
     base_name = os.path.splitext(os.path.basename(docx_path))[0]
     folder_name = sanitize_stem(base_name)
@@ -702,6 +841,7 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     image_by_hash, table_queue_by_hash, table_repeat_by_hash = extract_content_from_docx(docx_path, assets_dir)
     table_md_by_placeholder = {}
     table_seq = [0]
+    heading_level_map = extract_heading_level_map(docx_path)
     
     # 使用mammoth转换为HTML
     print(f"正在转换文档...")
@@ -755,7 +895,7 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
             print(f"  mammoth提示: {msg}")
     
     # 将HTML转换为Markdown
-    markdown = html_to_markdown(html)
+    markdown = html_to_markdown(html, heading_level_map)
     
     # 替换表格占位符
     for placeholder_key, table_md in table_md_by_placeholder.items():
@@ -771,7 +911,7 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     return md_path
 
 
-def html_to_markdown(html):
+def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     """将HTML转换为Markdown"""
     
     # 处理标题
@@ -782,6 +922,31 @@ def html_to_markdown(html):
     html = re.sub(r'<h5[^>]*>(.*?)</h5>', r'##### \1\n\n', html, flags=re.DOTALL)
     html = re.sub(r'<h6[^>]*>(.*?)</h6>', r'###### \1\n\n', html, flags=re.DOTALL)
     
+    # 优先按 DOCX 原始 heading 样式提升标题层级（主流程），避免纯文本启发式误判。
+    if heading_level_map:
+        def _replace_anchored_heading(match):
+            heading_id = match.group("id1") or match.group("id2") or match.group("id3") or ""
+            content = match.group("content")
+            level = heading_level_map.get(heading_id)
+            if not level:
+                return match.group(0)
+            text = re.sub(r"<[^>]+>", "", content, flags=re.DOTALL)
+            text = unescape(text).strip()
+            if not text:
+                return ""
+            return f"{'#' * level} {text}\n\n"
+
+        html = re.sub(
+            (
+                r"<p[^>]*>\s*"
+                r"<a[^>]*\bid\s*=\s*(?:\"(?P<id1>heading_\d+)\"|'(?P<id2>heading_\d+)'|(?P<id3>heading_\d+))[^>]*>"
+                r"\s*</a>(?P<content>.*?)</p>"
+            ),
+            _replace_anchored_heading,
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
     # 处理粗体和斜体
     html = re.sub(r'<strong>(.*?)</strong>', r'**\1**', html, flags=re.DOTALL)
     html = re.sub(r'<b>(.*?)</b>', r'**\1**', html, flags=re.DOTALL)
@@ -789,7 +954,20 @@ def html_to_markdown(html):
     html = re.sub(r'<i>(.*?)</i>', r'*\1*', html, flags=re.DOTALL)
     
     # 处理图片
-    html = re.sub(r'<img[^>]*src="([^"]*)"[^>]*/?>',  r'![](\1)\n\n', html)
+    def _replace_img(match):
+        src = match.group("src1") or match.group("src2") or match.group("src3") or ""
+        return f"![]({src})\n\n"
+
+    html = re.sub(
+        (
+            r"<img\b[^>]*\bsrc\s*=\s*"
+            r"(?:\"(?P<src1>[^\"]*)\"|'(?P<src2>[^']*)'|(?P<src3>[^\s\"'=<>`]+))"
+            r"[^>]*/?>"
+        ),
+        _replace_img,
+        html,
+        flags=re.IGNORECASE,
+    )
     
     # 处理链接
     html = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', html, flags=re.DOTALL)
