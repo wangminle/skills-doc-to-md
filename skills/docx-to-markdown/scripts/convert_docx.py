@@ -12,13 +12,355 @@ import re
 import xml.etree.ElementTree as ET
 import io
 import unicodedata
+from html import unescape
+from html.parser import HTMLParser
 from collections import defaultdict
 import posixpath
+from typing import List
 
 
 _FORBIDDEN_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 _WHITESPACE_RE = re.compile(r"\s+")
 _QUOTE_CHARS = '"“”‘’‚‛„‟«»‹›'
+
+
+def _normalize_markdown_cell_text(value: str) -> str:
+    """将单元格内容规范化为 Markdown 管道表可安全呈现的单行文本。"""
+    text = unescape(value or "").replace("\xa0", " ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    text = "<br>".join(lines) if lines else ""
+    return text.replace("|", r"\|")
+
+
+class _TableHTMLParser(HTMLParser):
+    """解析单个 HTML table，保留 rowspan/colspan 与单元格文本。"""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self._in_tr = False
+        self._in_cell = False
+        self._current_row = []
+        self._cell_parts = []
+        self._cell_tag = None
+        self._cell_rowspan = 1
+        self._cell_colspan = 1
+
+    @staticmethod
+    def _safe_int(raw, default=1):
+        try:
+            value = int(raw)
+            return value if value > 0 else default
+        except Exception:
+            return default
+
+    def handle_starttag(self, tag, attrs):
+        attrs_map = dict(attrs)
+        tag = tag.lower()
+        if tag == "tr":
+            self._in_tr = True
+            self._current_row = []
+            return
+
+        if tag in ("td", "th") and self._in_tr:
+            self._in_cell = True
+            self._cell_tag = tag
+            self._cell_parts = []
+            self._cell_rowspan = self._safe_int(attrs_map.get("rowspan"), 1)
+            self._cell_colspan = self._safe_int(attrs_map.get("colspan"), 1)
+            return
+
+        if self._in_cell and tag in ("br",):
+            self._cell_parts.append("\n")
+        elif self._in_cell and tag in ("p", "div", "li"):
+            if self._cell_parts and not self._cell_parts[-1].endswith("\n"):
+                self._cell_parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("p", "div", "li") and self._in_cell:
+            if self._cell_parts and not self._cell_parts[-1].endswith("\n"):
+                self._cell_parts.append("\n")
+            return
+
+        if tag in ("td", "th") and self._in_cell:
+            text = _normalize_markdown_cell_text("".join(self._cell_parts))
+            self._current_row.append(
+                {
+                    "text": text,
+                    "rowspan": self._cell_rowspan,
+                    "colspan": self._cell_colspan,
+                    "is_header": self._cell_tag == "th",
+                }
+            )
+            self._in_cell = False
+            self._cell_parts = []
+            self._cell_tag = None
+            self._cell_rowspan = 1
+            self._cell_colspan = 1
+            return
+
+        if tag == "tr" and self._in_tr:
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._in_tr = False
+            self._current_row = []
+
+    def handle_data(self, data):
+        if self._in_cell:
+            self._cell_parts.append(data)
+
+
+def _normalize_list_item_text(value: str) -> str:
+    lines = []
+    for raw in (value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not raw.strip():
+            continue
+        # 嵌套列表行保留原始缩进，避免层级被破坏。
+        if re.match(r"^\s+(-|\d+\.)\s+", raw):
+            lines.append(raw.rstrip())
+        else:
+            lines.append(re.sub(r"\s+", " ", raw).strip())
+    return "\n".join(lines)
+
+
+class _ListHTMLTransformer(HTMLParser):
+    """将 HTML 列表结构转换为 Markdown 列表，保留嵌套层级。"""
+
+    def __init__(self):
+        super().__init__()
+        self._out = []
+        self._list_stack = []  # [{"type": "ul"/"ol", "items": [str, ...]}]
+        self._li_stack = []  # [list[str], ...]
+
+    @staticmethod
+    def _attrs_to_str(attrs):
+        if not attrs:
+            return ""
+        pairs = []
+        for k, v in attrs:
+            if v is None:
+                pairs.append(k)
+            else:
+                escaped = str(v).replace('"', "&quot;")
+                pairs.append(f'{k}="{escaped}"')
+        return " " + " ".join(pairs)
+
+    @staticmethod
+    def _render_list(context, depth):
+        indent = "  " * depth
+        is_ordered = context["type"] == "ol"
+        lines = []
+        for idx, item in enumerate(context["items"], 1):
+            marker = f"{idx}. " if is_ordered else "- "
+            normalized = _normalize_list_item_text(item)
+            if not normalized:
+                lines.append(f"{indent}{marker}".rstrip())
+                continue
+            item_lines = normalized.splitlines()
+            lines.append(f"{indent}{marker}{item_lines[0].strip()}")
+            for extra in item_lines[1:]:
+                if extra.startswith("  "):
+                    lines.append(f"{indent}{extra}")
+                else:
+                    lines.append(f"{indent}  {extra.strip()}")
+        return "\n".join(lines)
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in ("ul", "ol"):
+            self._list_stack.append({"type": tag, "items": []})
+            return
+        if tag == "li" and self._list_stack:
+            self._li_stack.append([])
+            return
+
+        if self._li_stack:
+            if tag == "br":
+                self._li_stack[-1].append("\n")
+            elif tag in ("p", "div"):
+                if self._li_stack[-1] and not self._li_stack[-1][-1].endswith("\n"):
+                    self._li_stack[-1].append("\n")
+            return
+
+        self._out.append(f"<{tag}{self._attrs_to_str(attrs)}>")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in ("ul", "ol") and self._list_stack:
+            context = self._list_stack.pop()
+            md = self._render_list(context, len(self._list_stack))
+            if self._li_stack:
+                if self._li_stack[-1] and not self._li_stack[-1][-1].endswith("\n"):
+                    self._li_stack[-1].append("\n")
+                self._li_stack[-1].append(md)
+            else:
+                self._out.append("\n" + md + "\n")
+            return
+
+        if tag == "li" and self._li_stack:
+            item_text = "".join(self._li_stack.pop())
+            if self._list_stack:
+                self._list_stack[-1]["items"].append(item_text)
+            return
+
+        if self._li_stack:
+            if tag in ("p", "div"):
+                if self._li_stack[-1] and not self._li_stack[-1][-1].endswith("\n"):
+                    self._li_stack[-1].append("\n")
+            return
+
+        self._out.append(f"</{tag}>")
+
+    def handle_startendtag(self, tag, attrs):
+        tag = tag.lower()
+        if self._li_stack and tag == "br":
+            self._li_stack[-1].append("\n")
+            return
+        if self._li_stack:
+            return
+        self._out.append(f"<{tag}{self._attrs_to_str(attrs)}/>")
+
+    def handle_data(self, data):
+        if self._li_stack:
+            self._li_stack[-1].append(data)
+            return
+        if self._list_stack:
+            # 列表容器中但不在 li 内的噪声文本通常只有空白，忽略。
+            return
+        self._out.append(data)
+
+    def get_output(self):
+        return "".join(self._out)
+
+
+def transform_html_lists_to_markdown(html: str) -> str:
+    parser = _ListHTMLTransformer()
+    parser.feed(html)
+    parser.close()
+    return parser.get_output()
+
+
+def _expand_table_rows(rows):
+    """将包含 rowspan/colspan 的行展开为等宽二维表。"""
+    expanded = []
+    spans = {}  # col_idx -> {"rows_left": int, "text": str}
+
+    for row in rows:
+        out_row = []
+        col = 0
+
+        def consume_span_at_current_col():
+            nonlocal col
+            while col in spans:
+                span = spans[col]
+                out_row.append(span["text"])
+                span["rows_left"] -= 1
+                if span["rows_left"] <= 0:
+                    spans.pop(col, None)
+                col += 1
+
+        consume_span_at_current_col()
+        for cell in row:
+            consume_span_at_current_col()
+            text = cell["text"]
+            rowspan = max(1, int(cell["rowspan"]))
+            colspan = max(1, int(cell["colspan"]))
+            for offset in range(colspan):
+                out_row.append(text)
+                if rowspan > 1:
+                    spans[col + offset] = {"rows_left": rowspan - 1, "text": text}
+            col += colspan
+
+        consume_span_at_current_col()
+        expanded.append(out_row)
+
+    while spans:
+        out_row = []
+        col = 0
+        max_col = max(spans.keys())
+        while col <= max_col:
+            if col in spans:
+                span = spans[col]
+                out_row.append(span["text"])
+                span["rows_left"] -= 1
+                if span["rows_left"] <= 0:
+                    spans.pop(col, None)
+            else:
+                out_row.append("")
+            col += 1
+        expanded.append(out_row)
+
+    width = max((len(row) for row in expanded), default=0)
+    if width:
+        expanded = [row + [""] * (width - len(row)) for row in expanded]
+    return expanded
+
+
+def table_html_to_markdown(table_html: str) -> str:
+    parser = _TableHTMLParser()
+    parser.feed(table_html)
+    parser.close()
+
+    rows = _expand_table_rows(parser.rows)
+    if not rows:
+        return ""
+
+    lines = []
+    lines.append("| " + " | ".join(rows[0]) + " |")
+    lines.append("| " + " | ".join(["---"] * len(rows[0])) + " |")
+    for row in rows[1:]:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines) + "\n\n"
+
+
+def promote_numbered_bold_headings(markdown: str) -> str:
+    """将“编号 + 加粗标题”段落提升为 Markdown 标题。"""
+    pattern = re.compile(
+        r"^(?P<num>\d+(?:\.\d+)*)(?P<dot>\.)?\s+\*\*(?P<title>[^*\n]+)\*\*\s*$",
+        flags=0,
+    )
+    heading_pattern = re.compile(r"^(#{1,6})\s+")
+
+    lines = markdown.splitlines()
+    out = []
+    previous_heading_level = 0
+    previous_promoted_depth = None
+
+    for line in lines:
+        heading_match = heading_pattern.match(line)
+        if heading_match:
+            previous_heading_level = len(heading_match.group(1))
+            previous_promoted_depth = None
+            out.append(line)
+            continue
+
+        match = pattern.match(line.strip())
+        if not match:
+            out.append(line)
+            continue
+
+        num = match.group("num")
+        dot = match.group("dot") or ""
+        title = match.group("title").strip()
+        depth = num.count(".") + 1
+        level = min(depth + 1, 6)  # 1级编号 -> ##，2级编号 -> ###
+
+        # 在深层章节下的“1. **小节**”更接近子标题，避免被抬到过高层级。
+        if depth == 1 and previous_heading_level >= 3:
+            if previous_promoted_depth == 1:
+                level = previous_heading_level
+            else:
+                level = min(previous_heading_level + 1, 6)
+
+        promoted = f"{'#' * level} {num}{dot} {title}"
+        out.append(promoted)
+        previous_heading_level = level
+        previous_promoted_depth = depth
+
+    return "\n".join(out)
 
 
 def sanitize_stem(stem: str) -> str:
@@ -142,38 +484,85 @@ def excel_to_markdown(xlsx_data):
     try:
         import openpyxl
 
-        wb = openpyxl.load_workbook(io.BytesIO(xlsx_data), read_only=True, data_only=True)
-        ws = wb.active
-        if ws is None:
-            return None
+        def normalize_rows(raw_rows: List[List[str]]) -> List[List[str]]:
+            if not raw_rows:
+                return []
 
-        # 读取所有行
-        raw_rows = []
-        for row in ws.iter_rows(values_only=True):
-            raw_rows.append([str(cell) if cell is not None else '' for cell in row])
+            rows = [r for r in raw_rows if any(c.strip() for c in r)]
+            if not rows:
+                return []
+
+            col_count = max(len(r) for r in rows)
+            rows = [r + [''] * (col_count - len(r)) for r in rows]
+            non_empty_cols = [j for j in range(col_count) if any(rows[i][j].strip() for i in range(len(rows)))]
+            if not non_empty_cols:
+                return []
+            return [[r[j] for j in non_empty_cols] for r in rows]
+
+        def apply_vertical_merges(ws, raw_rows: List[List[str]]) -> List[List[str]]:
+            """将单列纵向合并单元格展开为每一行都带值。"""
+            if not raw_rows:
+                return raw_rows
+
+            for merged in ws.merged_cells.ranges:
+                min_row, max_row = merged.min_row, merged.max_row
+                min_col, max_col = merged.min_col, merged.max_col
+                if max_row <= min_row:
+                    continue
+                # 仅展开单列纵向合并；横向合并在 Markdown 管道表中保持空白。
+                if min_col != max_col:
+                    continue
+
+                row_idx = min_row - 1
+                col_idx = min_col - 1
+                if row_idx >= len(raw_rows):
+                    continue
+                if col_idx >= len(raw_rows[row_idx]):
+                    continue
+
+                anchor_value = raw_rows[row_idx][col_idx]
+                if not anchor_value:
+                    continue
+
+                for row_no in range(min_row, max_row + 1):
+                    i = row_no - 1
+                    if i >= len(raw_rows):
+                        continue
+                    if col_idx >= len(raw_rows[i]):
+                        raw_rows[i].extend([''] * (col_idx + 1 - len(raw_rows[i])))
+                    raw_rows[i][col_idx] = anchor_value
+            return raw_rows
+
+        def sheet_to_rows(ws) -> List[List[str]]:
+            raw_rows: List[List[str]] = []
+            for row in ws.iter_rows(values_only=True):
+                raw_rows.append([
+                    _normalize_markdown_cell_text(str(cell)) if cell is not None else ''
+                    for cell in row
+                ])
+            raw_rows = apply_vertical_merges(ws, raw_rows)
+            return normalize_rows(raw_rows)
+
+        # 不使用 read_only=True：部分嵌入工作簿的维度元数据异常，read_only 模式会把表格截断成 1x1。
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_data), read_only=False, data_only=True)
+        best_rows = []
+        best_score = -1
+        for ws in wb.worksheets:
+            rows = sheet_to_rows(ws)
+            if not rows:
+                continue
+            score = sum(1 for r in rows for c in r if c.strip())
+            if score > best_score:
+                best_rows = rows
+                best_score = score
         wb.close()
 
-        if not raw_rows:
+        if not best_rows:
             return None
 
-        # 去掉全空行
-        rows = [r for r in raw_rows if any(c.strip() for c in r)]
-        if not rows:
-            return None
-
-        # 去掉全空列
-        col_count = max(len(r) for r in rows)
-        # 补齐短行
-        rows = [r + [''] * (col_count - len(r)) for r in rows]
-        non_empty_cols = [j for j in range(col_count) if any(rows[i][j].strip() for i in range(len(rows)))]
-        if not non_empty_cols:
-            return None
-        rows = [[r[j] for j in non_empty_cols] for r in rows]
-
-        # 构建 Markdown 表格
-        header = '| ' + ' | '.join(rows[0]) + ' |'
-        separator = '| ' + ' | '.join(['---'] * len(rows[0])) + ' |'
-        body_lines = ['| ' + ' | '.join(r) + ' |' for r in rows[1:]]
+        header = '| ' + ' | '.join(best_rows[0]) + ' |'
+        separator = '| ' + ' | '.join(['---'] * len(best_rows[0])) + ' |'
+        body_lines = ['| ' + ' | '.join(r) + ' |' for r in best_rows[1:]]
         return header + '\n' + separator + '\n' + '\n'.join(body_lines)
 
     except Exception as e:
@@ -225,6 +614,8 @@ def extract_content_from_docx(docx_path, assets_dir):
                 markdown_table = excel_to_markdown(xlsx_data)
                 if markdown_table:
                     excel_md_by_path[excel_file] = markdown_table
+                else:
+                    print(f"  警告: Excel表格转换失败（将保留预览图）: {excel_file}")
 
         # 建立预览图 hash -> 表格队列（同一预览图内容可对应多个表格）
         pairs = ordered_pairs if ordered_pairs else [(e, p) for e, p in excel_to_preview.items()]
@@ -402,44 +793,26 @@ def html_to_markdown(html):
     
     # 处理链接
     html = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', html, flags=re.DOTALL)
+
+    # 先把HTML里的换行标签转为文本换行（需早于表格转换，避免改写表格里的 <br> 文本）
+    html = re.sub(r'<br\s*/?>', '\n', html)
+
+    # 先处理表格（必须在段落/列表转换之前）
+    html = re.sub(
+        r'<table[^>]*>.*?</table>',
+        lambda match: table_html_to_markdown(match.group(0)),
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    # 使用结构化解析处理列表，避免正则顺序导致的嵌套层级破坏。
+    html = transform_html_lists_to_markdown(html)
     
     # 处理段落
     html = re.sub(r'<p[^>]*>(.*?)</p>', r'\1\n\n', html, flags=re.DOTALL)
     
-    # 处理换行
-    html = re.sub(r'<br\s*/?>', '\n', html)
-    
-    # 处理列表
-    html = re.sub(r'<ul[^>]*>', '\n', html)
-    html = re.sub(r'</ul>', '\n', html)
-    html = re.sub(r'<ol[^>]*>', '\n', html)
-    html = re.sub(r'</ol>', '\n', html)
-    html = re.sub(r'<li[^>]*>(.*?)</li>', r'- \1\n', html, flags=re.DOTALL)
-    
-    # 处理表格 - 简化处理
-    def convert_table(match):
-        table_html = match.group(0)
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
-        if not rows:
-            return ''
-        
-        markdown_table = []
-        for i, row in enumerate(rows):
-            cells = re.findall(r'<t[hd][^>]*>(.*?)</t[hd]>', row, re.DOTALL)
-            # 清理单元格内容
-            cells = [re.sub(r'<[^>]+>', '', cell).strip() for cell in cells]
-            markdown_table.append('| ' + ' | '.join(cells) + ' |')
-            
-            # 在第一行后添加分隔符
-            if i == 0:
-                markdown_table.append('| ' + ' | '.join(['---'] * len(cells)) + ' |')
-        
-        return '\n'.join(markdown_table) + '\n\n'
-    
-    html = re.sub(r'<table[^>]*>.*?</table>', convert_table, html, flags=re.DOTALL)
-    
-    # 移除剩余的HTML标签
-    html = re.sub(r'<[^>]+>', '', html)
+    # 移除剩余的HTML标签（保留 <br> 供 Markdown 单元格换行显示）
+    html = re.sub(r'<(?!br\s*/?)[^>]+>', '', html, flags=re.IGNORECASE)
     
     # 清理多余的空行
     html = re.sub(r'\n{3,}', '\n\n', html)
@@ -450,7 +823,8 @@ def html_to_markdown(html):
     html = html.replace('&gt;', '>')
     html = html.replace('&amp;', '&')
     html = html.replace('&quot;', '"')
-    
+
+    html = promote_numbered_bold_headings(html)
     return html.strip()
 
 

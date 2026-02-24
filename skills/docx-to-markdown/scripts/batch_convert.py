@@ -29,6 +29,7 @@ def batch_convert(source_dir, output_dir):
     
     success_count = 0
     fail_count = 0
+    skip_count = 0
 
     os.makedirs(output_dir, exist_ok=True)
     
@@ -43,7 +44,7 @@ def batch_convert(source_dir, output_dir):
         # 检查是否已经处理过
         if os.path.exists(target_dir):
             print(f"  ⏭️  已存在，跳过")
-            success_count += 1
+            skip_count += 1
             continue
         
         try:
@@ -55,7 +56,7 @@ def batch_convert(source_dir, output_dir):
             fail_count += 1
     
     print(f"\n{'='*50}")
-    print(f"处理完成: 成功 {success_count} 个, 失败 {fail_count} 个")
+    print(f"处理完成: 成功 {success_count} 个, 跳过 {skip_count} 个, 失败 {fail_count} 个")
 
 if __name__ == '__main__':
     source_dir = '1-Reference'
