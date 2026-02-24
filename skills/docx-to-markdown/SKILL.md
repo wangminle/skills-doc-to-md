@@ -73,8 +73,9 @@ If output path is omitted, PDF is saved in the same directory as the input file.
 
 ### Heading Restoration
 
-- Prefer DOCX `heading_*` bookmarks + paragraph style mapping to recover Markdown heading levels
-- Renumber repeated reset-style numbered subheadings (for example multiple `1.` / `1.1` restarts) within local section scope
+- Prefer DOCX `heading_*` bookmarks + paragraph style mapping to recover Markdown heading levels (style/depth directly map to H1/H2/H3... without +1 offset)
+- Keep original numbering (no automatic renumbering for reset-style sections like repeated `1.` / `1.1`) to avoid mutating bilingual or manually numbered headings
+- Conservatively promote a leading full-line bold paragraph to H1 only when later numbered section headings exist
 
 ### Embedded Excel Conversion
 

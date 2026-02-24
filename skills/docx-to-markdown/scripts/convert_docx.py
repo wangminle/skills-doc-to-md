@@ -347,10 +347,10 @@ def promote_numbered_bold_headings(markdown: str) -> str:
         dot = match.group("dot") or ""
         title = match.group("title").strip()
         depth = num.count(".") + 1
-        level = min(depth + 1, 6)  # 1级编号 -> ##，2级编号 -> ###
+        level = min(depth, 6)  # 1级编号 -> #，2级编号 -> ##
 
         # 在深层章节下的“1. **小节**”更接近子标题，避免被抬到过高层级。
-        if depth == 1 and previous_heading_level >= 3:
+        if depth == 1 and previous_heading_level >= 2:
             if previous_promoted_depth == 1:
                 level = previous_heading_level
             else:
@@ -361,71 +361,38 @@ def promote_numbered_bold_headings(markdown: str) -> str:
         previous_heading_level = level
         previous_promoted_depth = depth
 
-    # 一些 DOCX 会被导出成多个独立的 `<ol><li>`，导致“1.”在同一章节内反复重置。
-    # 这里按“标题层级 + 上级章节 + 当前粗体分节标记”做局部重排，仅修正重复的 1.x 小节。
-    renumbered = []
-    heading_stack = {}
-    heading_node_stack = {}
-    heading_node_seq = 0
-    counters = {}
-    current_bold_section = ""
-    heading_re = re.compile(
-        r"^(?P<hash>#{1,6})\s+(?P<num>\d+(?:\.\d+)*)(?P<dot>\.)?\s+(?P<title>.+)$"
-    )
-    any_heading_re = re.compile(r"^(?P<hash>#{1,6})\s+(?P<title>.+)$")
-    bold_section_re = re.compile(r"^\*\*[^*\n]+\*\*$")
+    # 保持原始编号，不做自动重排，避免双语并列标题或手工编号被误改。
+    return "\n".join(out)
 
-    for line in out:
-        stripped = line.strip()
-        if bold_section_re.match(stripped):
-            current_bold_section = stripped
-            renumbered.append(line)
-            continue
 
-        match = heading_re.match(line)
-        if match:
-            level = len(match.group("hash"))
-            num_text = match.group("num")
-            dot = match.group("dot") or ""
-            title = match.group("title")
-            parts = num_text.split(".")
-            last_num = int(parts[-1])
-            prefix = tuple(parts[:-1])
-            parent_nodes = tuple(heading_node_stack.get(i, 0) for i in range(1, level))
-            key = (level, parent_nodes, current_bold_section, prefix)
-            if last_num == 1:
-                last_num = counters.get(key, 0) + 1
-            counters[key] = last_num
-            new_num_text = ".".join([*prefix, str(last_num)]) if prefix else str(last_num)
+def promote_leading_bold_title(markdown: str) -> str:
+    """将文档开头“整行加粗标题”提升为一级标题（保守触发）。"""
+    lines = markdown.splitlines()
+    first_idx = None
+    for i, line in enumerate(lines):
+        if line.strip():
+            first_idx = i
+            break
+    if first_idx is None:
+        return markdown
 
-            for lvl in list(heading_stack.keys()):
-                if lvl >= level:
-                    heading_stack.pop(lvl, None)
-                    heading_node_stack.pop(lvl, None)
+    first_line = lines[first_idx].strip()
+    m = re.match(r"^\*\*(?P<title>.+?)\*\*$", first_line)
+    if not m:
+        return markdown
 
-            heading_stack[level] = f"{new_num_text}{dot} {title}".strip()
-            heading_node_seq += 1
-            heading_node_stack[level] = heading_node_seq
-            renumbered.append(f"{match.group('hash')} {new_num_text}{dot} {title}")
-            continue
+    # 仅在后续存在“编号章节标题”时触发，降低把普通强调段误判成标题的风险。
+    section_heading_re = re.compile(r"^#{1,6}\s+\d+(?:\.\d+)*\.?\s+")
+    has_numbered_section_heading = any(section_heading_re.match(line.strip()) for line in lines[first_idx + 1 :])
+    if not has_numbered_section_heading:
+        return markdown
 
-        heading_match = any_heading_re.match(line)
-        if heading_match:
-            level = len(heading_match.group("hash"))
-            for lvl in list(heading_stack.keys()):
-                if lvl >= level:
-                    heading_stack.pop(lvl, None)
-                    heading_node_stack.pop(lvl, None)
-            heading_stack[level] = heading_match.group("title").strip()
-            heading_node_seq += 1
-            heading_node_stack[level] = heading_node_seq
-            current_bold_section = ""
-            renumbered.append(line)
-            continue
+    title = m.group("title").strip()
+    if not title:
+        return markdown
 
-        renumbered.append(line)
-
-    return "\n".join(renumbered)
+    lines[first_idx] = f"# {title}"
+    return "\n".join(lines)
 
 
 def sanitize_stem(stem: str) -> str:
@@ -466,15 +433,15 @@ def extract_heading_level_map(docx_path: str) -> Dict[str, int]:
         n = int(m.group(1))
         if n <= 0:
             return None
-        # style=1/2/3 对应二/三/四级标题，保留历史输出约定（# 留给文档总标题）。
-        return min(n + 1, 6)
+        # style=1/2/3 对应一/二/三级标题。
+        return min(n, 6)
 
     def infer_level_from_text(text: str) -> Optional[int]:
         m = re.match(r"^\s*(\d+(?:\.\d+)*)\s*\.?\s+", text or "")
         if not m:
             return None
         depth = m.group(1).count(".") + 1
-        return min(depth + 1, 6)
+        return min(depth, 6)
 
     level_map: Dict[str, int] = {}
     try:
@@ -1003,6 +970,7 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     html = html.replace('&quot;', '"')
 
     html = promote_numbered_bold_headings(html)
+    html = promote_leading_bold_title(html)
     return html.strip()
 
 

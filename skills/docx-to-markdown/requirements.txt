@@ -1,2 +1,4 @@
 mammoth
 openpyxl
+markdown
+reportlab
