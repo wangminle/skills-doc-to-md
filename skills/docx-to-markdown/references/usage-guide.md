@@ -12,6 +12,9 @@
 
 ## convert_docx.py 详解
 
+> **执行目录前提**：以下所有 `python scripts/...` 命令均假设当前工作目录为 skill 根目录 `skills/docx-to-markdown/`。
+> 若从仓库根目录执行，需加上路径前缀：`python skills/docx-to-markdown/scripts/...`
+
 ### 核心功能
 
 将单个 DOCX 文档转换为 Markdown，同时提取图片和转换嵌入的 Excel 表格。
@@ -19,6 +22,7 @@
 ### 命令行用法
 
 ```bash
+# 在 skills/docx-to-markdown/ 目录下执行
 python scripts/convert_docx.py <docx文件路径> <输出目录>
 ```
 
@@ -111,7 +115,41 @@ output/
 - 标题层级映射规则：段落样式编号/文本编号深度与 Markdown `#` 层级直接对应（不再 `+1` 偏移）
 - 编号标题默认保持原始编号，不进行自动重排
 - 文首整行加粗仅在后续存在“编号章节标题”时提升为一级标题
-- `<img src=...>` 支持双引号、单引号、无引号三种写法
+- `<img src=...>` 和 `<a href=...>` 支持双引号、单引号、无引号三种写法
+- HTML 实体通过 `html.unescape()` 统一解码，覆盖所有命名和数字实体
+
+#### `_convert_footnotes(html)`
+
+将 mammoth 生成的脚注 HTML 转换为 Markdown 脚注语法 `[^N]` / `[^N]: text`。
+
+**mammoth 输出格式：**
+- 正文引用: `<sup><a href="#footnote-N">[N]</a></sup>`
+- 文末列表: `<li id="footnote-N"><p>text ↑</p></li>`
+
+**转换结果：**
+- 正文引用 → `[^N]`
+- 文末 → `[^N]: text`（以 `---` 分隔线分隔）
+
+#### `extract_textbox_content(docx_path)`
+
+从 DOCX 的 `document.xml` 中提取文本框 `<w:txbxContent>` 的纯文本内容。
+
+mammoth 通常忽略文本框/形状中的内容，此函数作为补充提取。返回非空文本块列表。
+
+#### `extract_math_text(docx_path)`
+
+从 DOCX 的 `document.xml` 中提取 OMML 数学公式 `<m:oMath>` 的纯文本。
+
+完整的 OMML→LaTeX 转换极为复杂，此函数仅提取公式中的文本节点，用 `$$ ... $$` 包裹作为占位标记。
+
+#### `_format_cell_value(cell)`
+
+将 openpyxl 单元格值转为友好字符串：
+- `datetime` 仅含日期 → `YYYY-MM-DD`（不输出 `00:00:00`）
+- `datetime` 含时间 → `YYYY-MM-DD HH:MM:SS`
+- `date` → `YYYY-MM-DD`
+- `time` → `HH:MM:SS`
+- 整数 `float` → `int`（如 `3.0` → `3`）
 
 ---
 
@@ -124,7 +162,7 @@ output/
 ### 命令行用法
 
 ```bash
-python scripts/batch_convert.py [源目录] [输出目录]
+python scripts/batch_convert.py [源目录] [输出目录] [--force]
 ```
 
 **默认值：**
@@ -134,14 +172,28 @@ python scripts/batch_convert.py [源目录] [输出目录]
 **示例：**
 ```bash
 python scripts/batch_convert.py ./documents ./markdown_output
+
+# 强制重新转换已存在的输出目录
+python scripts/batch_convert.py ./documents ./markdown_output --force
 ```
+
+### 核心函数
+
+#### `batch_convert(source_dir, output_dir, force=False)`
+
+**参数：**
+- `source_dir`: 源文件目录
+- `output_dir`: 输出目录
+- `force`: 为 `True` 时强制重新转换已存在的输出目录（删除旧目录后重新生成）
 
 ### 特性
 
-1. **自动跳过** - 已存在的输出目录会被跳过
-2. **进度显示** - 显示 `[当前/总数]` 进度
-3. **统计汇总** - 结束时显示成功/失败数量
-4. **文件名清理与防冲突** - 自动清理非法字符；超长文件名会附加短 hash
+1. **自动跳过** - 已存在的输出目录会被跳过（使用 `--force` 可强制重新转换）
+2. **`--force` 模式** - 删除已有输出目录后重新转换，适合文档更新后需要重新生成的场景
+3. **进度显示** - 显示 `[当前/总数]` 进度
+4. **统计汇总** - 结束时显示成功/失败数量
+5. **文件名清理与防冲突** - 自动清理非法字符；超长文件名会附加短 hash
+6. **大小写去重** - macOS 等大小写不敏感文件系统上自动去重 `.docx`/`.DOCX`
 
 ### 输出结构
 
@@ -258,6 +310,27 @@ python scripts/md_to_pdf.py document.md output.pdf --engine python
 - 文件损坏
 - 密码保护
 - 非标准 DOCX 格式
+
+### Q: 文档更新后想重新转换，但输出已存在怎么办？
+
+使用 `--force` 参数强制重新转换：
+```bash
+python scripts/batch_convert.py ./documents ./output --force
+```
+该模式会删除已有输出目录后重新生成。
+
+### Q: 脚注能自动转换吗？
+
+可以。mammoth 生成的脚注 HTML 会自动转换为 Markdown `[^N]` 脚注语法，脚注正文以 `---` 分隔线追加在文档末尾。
+
+### Q: 文档中的文本框或数学公式会被提取吗？
+
+- **文本框**：mammoth 通常会忽略 `<w:txbxContent>` 中的内容，脚本会自动提取并以引用块追加在文档末尾。
+- **数学公式**：OMML 数学公式的纯文本会被提取并以 `$$ ... $$` 标记输出。完整的 OMML→LaTeX 转换需要额外工具（如 pandoc 的 `--mathml` 选项）。
+
+### Q: Excel 表格中的日期显示了多余的 00:00:00？
+
+已修复。`datetime` 值当时间部分全为零时，仅输出 `YYYY-MM-DD`；整数 `float` 如 `3.0` 输出为 `3`。
 
 ---
 

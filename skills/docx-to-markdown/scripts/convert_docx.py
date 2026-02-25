@@ -5,6 +5,8 @@
 """
 
 import hashlib
+import logging
+import math
 import os
 import sys
 import zipfile
@@ -17,6 +19,8 @@ from html.parser import HTMLParser
 from collections import defaultdict
 import posixpath
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 _FORBIDDEN_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
@@ -512,7 +516,7 @@ def parse_relationships(docx_path):
                 target = rel.get('Target', '')
                 relationships[rid] = {'type': rel_type, 'target': target}
         except Exception as e:
-            print(f"  警告: 解析关系文件失败: {e}")
+            logger.warning("解析关系文件失败: %s", e)
             return excel_to_preview, preview_to_excel, ordered_pairs
 
         # --- 方法1：从 document.xml 解析 OLE 对象的真实引用 ---
@@ -573,6 +577,24 @@ def parse_relationships(docx_path):
     return excel_to_preview, preview_to_excel, ordered_pairs
 
 
+def _format_cell_value(cell) -> str:
+    """将 openpyxl 单元格值转换为友好的字符串表示。"""
+    if cell is None:
+        return ''
+    import datetime as _dt
+    if isinstance(cell, _dt.datetime):
+        if cell.hour == 0 and cell.minute == 0 and cell.second == 0 and cell.microsecond == 0:
+            return cell.strftime("%Y-%m-%d")
+        return cell.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(cell, _dt.date):
+        return cell.strftime("%Y-%m-%d")
+    if isinstance(cell, _dt.time):
+        return cell.strftime("%H:%M:%S")
+    if isinstance(cell, float) and math.isfinite(cell) and cell.is_integer():
+        return str(int(cell))
+    return str(cell)
+
+
 def excel_to_markdown(xlsx_data):
     """将Excel数据转换为Markdown表格（仅依赖 openpyxl，无需 pandas）"""
     try:
@@ -627,7 +649,7 @@ def excel_to_markdown(xlsx_data):
             raw_rows: List[List[str]] = []
             for row in ws.iter_rows(values_only=True):
                 raw_rows.append([
-                    _normalize_markdown_cell_text(str(cell)) if cell is not None else ''
+                    _normalize_markdown_cell_text(_format_cell_value(cell))
                     for cell in row
                 ])
             score_rows = normalize_rows(raw_rows)
@@ -664,7 +686,7 @@ def excel_to_markdown(xlsx_data):
         return table_text
 
     except Exception as e:
-        print(f"    Excel转Markdown失败: {e}")
+        logger.warning("Excel转Markdown失败: %s", e)
         return None
 
 
@@ -713,7 +735,7 @@ def extract_content_from_docx(docx_path, assets_dir):
                 if markdown_table:
                     excel_md_by_path[excel_file] = markdown_table
                 else:
-                    print(f"  警告: Excel表格转换失败（将保留预览图）: {excel_file}")
+                    logger.warning("Excel表格转换失败（将保留预览图）: %s", excel_file)
 
         # 建立预览图 hash -> 表格队列（同一预览图内容可对应多个表格）
         pairs = ordered_pairs if ordered_pairs else [(e, p) for e, p in excel_to_preview.items()]
@@ -728,7 +750,7 @@ def extract_content_from_docx(docx_path, assets_dir):
             table_queue_by_hash[digest].append(table_md)
             table_repeat_by_hash[digest] = table_md
             table_preview_paths.add(preview_path)
-            print(f"  转换Excel为表格: {excel_path}")
+            logger.info("转换Excel为表格: %s", excel_path)
 
         # 处理图片
         for file_info in zip_ref.filelist:
@@ -766,9 +788,81 @@ def extract_content_from_docx(docx_path, assets_dir):
                         f.write(image_data)
 
                 image_by_hash.setdefault(digest, f"assets/{corrected_name}")
-                print(f"  提取图片: {corrected_name}")
+                logger.info("提取图片: %s", corrected_name)
     
     return image_by_hash, table_queue_by_hash, table_repeat_by_hash
+
+
+def extract_textbox_content(docx_path: str) -> List[str]:
+    """从 DOCX 的 document.xml 中提取文本框 (<w:txbxContent>) 内的纯文本。
+
+    mammoth 通常会忽略 text box / shape 中的内容，此函数作为补充。
+    返回非空文本块列表。
+    """
+    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns_wps = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+    tag_txbx = f"{{{ns_w}}}txbxContent"
+    tag_txbx_wps = f"{{{ns_wps}}}txbxContent"
+    tag_t = f"{{{ns_w}}}t"
+    tag_p = f"{{{ns_w}}}p"
+
+    blocks: List[str] = []
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            doc_xml = ET.fromstring(zf.read("word/document.xml"))
+
+        for txbx_tag in (tag_txbx, tag_txbx_wps):
+            for txbx in doc_xml.iter(txbx_tag):
+                paras = []
+                for p in txbx.findall(f".//{tag_p}"):
+                    text = "".join((t.text or "") for t in p.findall(f".//{tag_t}"))
+                    text = text.strip()
+                    if text:
+                        paras.append(text)
+                if paras:
+                    blocks.append("\n".join(paras))
+    except Exception:
+        pass
+    return blocks
+
+
+def extract_math_text(docx_path: str) -> List[str]:
+    """从 DOCX 的 document.xml 中提取 OMML 数学公式的纯文本内容。
+
+    完整的 OMML→LaTeX 转换极为复杂，此函数仅提取公式中的文本节点，
+    用 $ 包裹作为占位标记，便于下游人工校正。
+    """
+    ns_m = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    tag_omath = f"{{{ns_m}}}oMath"
+    tag_omath_para = f"{{{ns_m}}}oMathPara"
+    tag_t_m = f"{{{ns_m}}}t"
+    tag_t_w = f"{{{ns_w}}}t"
+
+    formulas: List[str] = []
+    try:
+        with zipfile.ZipFile(docx_path, "r") as zf:
+            doc_xml = ET.fromstring(zf.read("word/document.xml"))
+
+        seen = set()
+        for parent_tag in (tag_omath_para, tag_omath):
+            for node in doc_xml.iter(parent_tag):
+                node_id = id(node)
+                if node_id in seen:
+                    continue
+                seen.add(node_id)
+                parts = []
+                for t in node.iter():
+                    if t.tag in (tag_t_m, tag_t_w) and t.text:
+                        parts.append(t.text)
+                text = "".join(parts).strip()
+                if text:
+                    formulas.append(text)
+                for child in node.iter(tag_omath):
+                    seen.add(id(child))
+    except Exception:
+        pass
+    return formulas
 
 
 def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
@@ -804,14 +898,14 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     os.makedirs(assets_dir, exist_ok=True)
     
     # 提取图片和Excel表格
-    print(f"正在提取内容...")
+    logger.info("正在提取内容...")
     image_by_hash, table_queue_by_hash, table_repeat_by_hash = extract_content_from_docx(docx_path, assets_dir)
     table_md_by_placeholder = {}
     table_seq = [0]
     heading_level_map = extract_heading_level_map(docx_path)
     
     # 使用mammoth转换为HTML
-    print(f"正在转换文档...")
+    logger.info("正在转换文档...")
 
     def convert_image(image):
         """根据图片内容hash，返回对应的assets路径或表格占位符"""
@@ -828,7 +922,9 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
             table_md_by_placeholder[placeholder] = table_md
             return {"src": placeholder}
 
-        # 队列被消耗完时，继续复用最后一次已知表格，避免退化为普通图片
+        # 防御性兜底：当前队列逻辑保证最后一个元素不会被弹出，因此此分支在
+        # 正常流程中不会触发。保留此分支作为安全网，以防未来队列策略调整后
+        # 队列被完全消耗的情况，确保仍能稳定替换为表格而非退化为普通图片。
         if digest in table_repeat_by_hash:
             table_md = table_repeat_by_hash[digest]
             placeholder = f"__TABLE_PLACEHOLDER_{digest}_{table_seq[0]}__"
@@ -859,7 +955,7 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
         )
         html = result.value
         for msg in getattr(result, "messages", []) or []:
-            print(f"  mammoth提示: {msg}")
+            logger.debug("mammoth提示: %s", msg)
     
     # 将HTML转换为Markdown
     markdown = html_to_markdown(html, heading_level_map)
@@ -868,19 +964,94 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     for placeholder_key, table_md in table_md_by_placeholder.items():
         placeholder = f"![]({placeholder_key})"
         markdown = markdown.replace(placeholder, f"\n\n{table_md}\n\n")
-    
+
+    # 移除嵌入 Excel 替换后残留的预览图说明文本
+    markdown = re.sub(
+        r"\n+\*{0,2}点击图片可查看完整电子表格\*{0,2}\s*\n",
+        "\n",
+        markdown,
+    )
+
+    # 追加 mammoth 未能提取的文本框内容
+    textbox_blocks = extract_textbox_content(docx_path)
+    if textbox_blocks:
+        # 检查主体中是否已包含文本框文本（mammoth 有时也能提取部分文本框）
+        missing = [b for b in textbox_blocks if b.splitlines()[0] not in markdown]
+        if missing:
+            markdown += "\n\n---\n\n> **\\[文本框内容\\]**\n\n"
+            for block in missing:
+                markdown += f"> {block}\n>\n"
+            logger.info("追加了 %d 个文本框内容", len(missing))
+
+    # 追加 mammoth 未能提取的数学公式
+    math_formulas = extract_math_text(docx_path)
+    if math_formulas:
+        missing_math = [f for f in math_formulas if f not in markdown]
+        if missing_math:
+            markdown += "\n\n---\n\n> **\\[数学公式\\]**\n\n"
+            for formula in missing_math:
+                markdown += f"> $$ {formula} $$\n>\n"
+            logger.info("追加了 %d 个数学公式", len(missing_math))
+
     md_path = os.path.join(final_output_dir, f"{folder_name}.md")
     
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write(markdown)
     
-    print(f"转换完成: {md_path}")
+    logger.info("转换完成: %s", md_path)
     return md_path
+
+
+def _convert_footnotes(html: str) -> str:
+    """将 mammoth 生成的脚注 HTML 转换为 Markdown 脚注语法。
+
+    mammoth 输出格式：
+      正文引用: <sup><a href="#footnote-N" id="footnote-ref-N">[N]</a></sup>
+      文末列表: <li id="footnote-N"><p>text <a href="#footnote-ref-N">↑</a></p></li>
+    """
+    footnote_bodies: Dict[str, str] = {}
+
+    def _extract_footnote_body(match):
+        fid = match.group("fid")
+        body_html = match.group("body")
+        body_html = re.sub(r"</(?:p|div|li|br)\s*/?>", " ", body_html, flags=re.IGNORECASE)
+        body = re.sub(r"<[^>]+>", "", body_html, flags=re.DOTALL)
+        body = unescape(body).replace("↑", "").strip()
+        body = re.sub(r"  +", " ", body)
+        if body:
+            footnote_bodies[fid] = body
+        return ""
+
+    html = re.sub(
+        r'<li\b[^>]*\bid\s*=\s*["\']?footnote-(?P<fid>\d+)["\']?[^>]*>'
+        r"(?P<body>.*?)</li>",
+        _extract_footnote_body,
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    html = re.sub(
+        r"<sup>\s*<a\b[^>]*href\s*=\s*[\"']?#footnote-(\d+)[\"']?[^>]*>"
+        r"\s*\[\d+\]\s*</a>\s*</sup>",
+        lambda m: f"[^{m.group(1)}]",
+        html,
+        flags=re.IGNORECASE,
+    )
+
+    if footnote_bodies:
+        footer = "\n\n---\n\n"
+        for fid in sorted(footnote_bodies, key=int):
+            footer += f"[^{fid}]: {footnote_bodies[fid]}\n"
+        html += footer
+
+    return html
 
 
 def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     """将HTML转换为Markdown"""
-    
+
+    html = _convert_footnotes(html)
+
     # 处理标题
     html = re.sub(r'<h1[^>]*>(.*?)</h1>', r'# \1\n\n', html, flags=re.DOTALL)
     html = re.sub(r'<h2[^>]*>(.*?)</h2>', r'## \1\n\n', html, flags=re.DOTALL)
@@ -936,8 +1107,22 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
         flags=re.IGNORECASE,
     )
     
-    # 处理链接
-    html = re.sub(r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', r'[\2](\1)', html, flags=re.DOTALL)
+    # 处理链接（支持双引号、单引号、无引号三种 href 写法）
+    def _replace_link(match):
+        href = match.group("href1") or match.group("href2") or match.group("href3") or ""
+        text = match.group("text")
+        return f"[{text}]({href})"
+
+    html = re.sub(
+        (
+            r"<a\b[^>]*\bhref\s*=\s*"
+            r"(?:\"(?P<href1>[^\"]*)\"|'(?P<href2>[^']*)'|(?P<href3>[^\s\"'=<>`]+))"
+            r"[^>]*>(?P<text>.*?)</a>"
+        ),
+        _replace_link,
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
     # 先把HTML里的换行标签转为文本换行（需早于表格转换，避免改写表格里的 <br> 文本）
     html = re.sub(r'<br\s*/?>', '\n', html)
@@ -962,12 +1147,8 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     # 清理多余的空行
     html = re.sub(r'\n{3,}', '\n\n', html)
     
-    # 清理HTML实体
     html = html.replace('&nbsp;', ' ')
-    html = html.replace('&lt;', '<')
-    html = html.replace('&gt;', '>')
-    html = html.replace('&amp;', '&')
-    html = html.replace('&quot;', '"')
+    html = unescape(html)
 
     html = promote_numbered_bold_headings(html)
     html = promote_leading_bold_title(html)
@@ -975,6 +1156,8 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     if len(sys.argv) < 3:
         print("用法: python scripts/convert_docx.py <docx文件路径> <输出目录>  (在skill目录执行)")
         print("或:   python convert_docx.py <docx文件路径> <输出目录>          (在scripts目录执行)")
@@ -984,7 +1167,7 @@ if __name__ == '__main__':
     output_dir = sys.argv[2]
     
     if not os.path.exists(docx_path):
-        print(f"错误: 文件不存在 - {docx_path}")
+        logger.error("文件不存在 - %s", docx_path)
         sys.exit(1)
     
     convert_docx_to_markdown(docx_path, output_dir)

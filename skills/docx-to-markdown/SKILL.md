@@ -1,6 +1,6 @@
 ---
 name: docx-to-markdown
-description: "Convert Microsoft Word documents (.docx) to Markdown format with image extraction and embedded Excel table conversion. Use when (1) Converting DOCX files to Markdown, (2) Extracting images from Word documents, (3) Converting embedded Excel spreadsheets to Markdown tables, (4) Batch processing multiple DOCX files, (5) Optionally converting Markdown to PDF with Chinese font support."
+description: "Convert DOCX to Markdown with embedded Excel table conversion and image extraction. Use when (1) converting .docx files to Markdown, especially those containing embedded Excel spreadsheets, (2) extracting images from Word documents to local files with relative paths, (3) batch processing multiple DOCX files, (4) optionally converting Markdown to PDF with Chinese font support."
 ---
 
 # DOCX to Markdown Converter
@@ -28,6 +28,9 @@ Convert Word documents to Markdown with full support for images, embedded Excel 
 
 ## Quick Start
 
+All commands below assume the working directory is the **skill root** (`skills/docx-to-markdown/`).
+Install dependencies first: `pip install -r requirements.txt`
+
 ### Single File Conversion
 
 ```bash
@@ -50,6 +53,9 @@ When user mentions converting multiple DOCX files, use batch conversion:
 
 ```bash
 python scripts/batch_convert.py <source_dir> <output_dir>
+
+# Force re-convert even if output already exists
+python scripts/batch_convert.py <source_dir> <output_dir> --force
 ```
 
 Each DOCX creates a separate folder with its MD file and assets.
@@ -106,6 +112,14 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 - Cleans invalid filename characters and quote variants
 - For very long document names, truncates safely and appends a short hash suffix to avoid directory collisions
 
+### Additional Enhancements
+
+- **Excel date/number formatting**: `datetime` with zero time → `YYYY-MM-DD`; integer `float` → no `.0`
+- **Footnotes**: mammoth footnote HTML → Markdown `[^N]` / `[^N]: text` syntax
+- **Text boxes**: Extracts `<w:txbxContent>` content ignored by mammoth, appended as blockquote
+- **Math formulas**: Extracts OMML text nodes, wraps in `$$ ... $$` (basic detection, not full LaTeX)
+- **Residual text cleanup**: Removes "点击图片可查看完整电子表格" after table replacement
+
 ### Format Support
 
 | Element | Support |
@@ -117,15 +131,19 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 | Images | ✅ |
 | Hyperlinks | ✅ |
 | Embedded Excel | ✅ → Markdown tables |
+| Footnotes | ✅ → `[^N]` syntax |
+| Text boxes | ✅ → Appended blockquote |
+| Math (OMML) | ⚠️ Text extraction only |
 
 ## Dependencies
 
-### Core (required)
-
 ```bash
 pip install -r requirements.txt
-# Installs: mammoth, openpyxl
+# Installs: mammoth, openpyxl (core) + markdown, reportlab (optional PDF engine)
 ```
+
+- **mammoth** + **openpyxl**: DOCX→Markdown 核心转换（必需）
+- **markdown** + **reportlab**: Python 内置 PDF 渲染引擎（仅 `md_to_pdf.py --engine python` 时使用；若系统有 pandoc 则可不装）
 
 ## Scripts Reference
 

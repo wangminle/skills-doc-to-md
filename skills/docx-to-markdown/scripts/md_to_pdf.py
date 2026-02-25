@@ -128,12 +128,7 @@ class MarkdownToPDFParser(HTMLParser):
             return
 
         if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            if self.heading_level == 1:
-                self.content.append(("h1", text))
-            elif self.heading_level == 2:
-                self.content.append(("h2", text))
-            else:
-                self.content.append(("h3", text))
+            self.content.append((f"h{self.heading_level}", text))
             self.heading_level = 0
         elif tag == "li":
             self.content.append(("bullet", text))
@@ -208,6 +203,26 @@ def convert_md_to_pdf(input_file: str, output_file: Optional[str] = None) -> str
         spaceBefore=15,
         leading=18,
     )
+    heading3_style = ParagraphStyle(
+        "CustomH3",
+        parent=styles["Heading3"],
+        fontName=chinese_font,
+        fontSize=11,
+        textColor=colors.HexColor("#34495e"),
+        spaceAfter=8,
+        spaceBefore=12,
+        leading=16,
+    )
+    heading4_style = ParagraphStyle(
+        "CustomH4",
+        parent=styles["Normal"],
+        fontName=chinese_font,
+        fontSize=10,
+        textColor=colors.HexColor("#34495e"),
+        spaceAfter=6,
+        spaceBefore=10,
+        leading=15,
+    )
     normal_style = ParagraphStyle(
         "CustomNormal",
         parent=styles["Normal"],
@@ -242,17 +257,20 @@ def convert_md_to_pdf(input_file: str, output_file: Optional[str] = None) -> str
     parser = MarkdownToPDFParser()
     parser.feed(html_content)
 
+    heading_style_map = {
+        "h1": title_style,
+        "h2": heading1_style,
+        "h3": heading2_style,
+        "h4": heading3_style,
+        "h5": heading4_style,
+        "h6": heading4_style,
+    }
+
     story = []
     for item_type, text in parser.content:
-        if item_type == "h1":
-            story.append(Paragraph(text, title_style))
-            story.append(Spacer(1, 0.3 * cm))
-        elif item_type == "h2":
-            story.append(Paragraph(text, heading1_style))
-            story.append(Spacer(1, 0.2 * cm))
-        elif item_type == "h3":
-            story.append(Paragraph(text, heading2_style))
-            story.append(Spacer(1, 0.2 * cm))
+        if item_type in heading_style_map:
+            story.append(Paragraph(text, heading_style_map[item_type]))
+            story.append(Spacer(1, 0.3 * cm if item_type == "h1" else 0.2 * cm))
         elif item_type == "bullet":
             story.append(Paragraph("• " + text, bullet_style))
         elif item_type == "paragraph":
