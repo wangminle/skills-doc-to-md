@@ -691,7 +691,7 @@ def excel_to_markdown(xlsx_data):
 
 
 def detect_image_format(image_data):
-    """检测图片的真实格式"""
+    """检测图片的真实格式；无法识别时返回 None（调用方应保留原扩展名）"""
     if image_data[:8] == b'\x89PNG\r\n\x1a\n':
         return '.png'
     elif image_data[:2] == b'\xff\xd8':
@@ -702,8 +702,13 @@ def detect_image_format(image_data):
         return '.webp'
     elif image_data[:2] == b'BM':
         return '.bmp'
-    else:
-        return '.png'  # 默认
+    elif image_data[:4] in (b'II*\x00', b'MM\x00*'):
+        return '.tiff'
+    elif image_data[:4] == b'\xd7\xcd\xc6\x9a':
+        return '.wmf'
+    elif len(image_data) >= 44 and image_data[40:44] == b' EMF':
+        return '.emf'
+    return None
 
 
 def extract_content_from_docx(docx_path, assets_dir):
@@ -765,8 +770,10 @@ def extract_content_from_docx(docx_path, assets_dir):
                 image_data = zip_ref.read(file_info.filename)
                 digest = hashlib.sha256(image_data).hexdigest()
                 
-                # 检测真实的图片格式并修正扩展名
-                actual_ext = detect_image_format(image_data)
+                # 检测真实的图片格式并修正扩展名；无法识别时保留原扩展名，
+                # 避免把 WMF/EMF 等格式误写成 .png 造成文件损坏
+                original_ext = os.path.splitext(image_name)[1].lower()
+                actual_ext = detect_image_format(image_data) or original_ext or ".png"
                 base_name = os.path.splitext(image_name)[0]
                 corrected_name = f"{base_name}{actual_ext}"
                 
@@ -938,6 +945,14 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
 
         # 兜底：某些情况下zip里的图片与mammoth回调数据不一致，直接按hash写入assets
         ext = detect_image_format(image_data)
+        if not ext:
+            # 依据 mammoth 提供的 content_type 推断扩展名，仍未知则保留二进制原名
+            content_subtype = (getattr(image, "content_type", "") or "").split("/")[-1].lower()
+            ext = {
+                "jpeg": ".jpeg", "jpg": ".jpeg", "png": ".png", "gif": ".gif",
+                "webp": ".webp", "bmp": ".bmp", "tiff": ".tiff",
+                "x-wmf": ".wmf", "x-emf": ".emf",
+            }.get(content_subtype, ".bin")
         filename = f"image_{digest[:16]}{ext}"
         image_path = os.path.join(assets_dir, filename)
         if not os.path.exists(image_path):
@@ -964,6 +979,12 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     for placeholder_key, table_md in table_md_by_placeholder.items():
         placeholder = f"![]({placeholder_key})"
         markdown = markdown.replace(placeholder, f"\n\n{table_md}\n\n")
+
+    # 自检：占位符未被替换通常意味着 mammoth 输出的 HTML 结构与预期不符，
+    # 保留占位符并告警，便于发现未知文档结构的退化情况。
+    leftover = re.findall(r"__TABLE_PLACEHOLDER_[0-9a-f]+_\d+__", markdown)
+    if leftover:
+        logger.warning("有 %d 个表格占位符未能替换为表格（请检查输出）", len(leftover))
 
     # 移除嵌入 Excel 替换后残留的预览图说明文本
     markdown = re.sub(

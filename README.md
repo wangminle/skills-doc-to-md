@@ -1,5 +1,7 @@
 # skills-docstomd-withpics
 
+![Version](https://img.shields.io/badge/version-0.1.5-blue)
+
 本仓库用于发布一个 Codex Skill：`docx-to-markdown`（`skills/docx-to-markdown/SKILL.md`），用于将 Word 的 `.docx` 文档转换为 Markdown，并提取图片/转换嵌入的 Excel 表格。
 
 ## 核心价值
@@ -23,7 +25,7 @@
 - 数学公式基础提取：检测 OMML 数学公式并提取纯文本，以 `$$ ... $$` 标记输出
 - 残留预览文本清理：表格替换后自动移除「点击图片可查看完整电子表格」等残留说明
 - 批处理：批量转换目录下多个 DOCX，支持 `--force` 强制重新转换
-- `.md → .pdf`（可选）：独立脚本，优先走 pandoc，支持中文字体回退
+- `.md → .pdf`（可选）：独立脚本，优先 pandoc；pandoc 失败时自动切换 xelatex + CJK 字体，最终回退 Python 引擎；Python 引擎对含 `<>` `&` 的文本做了 escape 安全处理
 - 文件名稳健：自动清理非法字符；超长文件名会附加短 hash，避免不同文件名截断后冲突
 
 ## 快速开始
@@ -69,7 +71,7 @@ output_dir/
 
 | 文件 | 包含 | 用途 |
 |------|------|------|
-| `requirements.txt` | mammoth, openpyxl | 核心转换功能 |
+| `requirements.txt` | mammoth, openpyxl（核心）；markdown, reportlab（可选） | 核心转换 + 可选 PDF 功能 |
 | `scripts/md_to_pdf.py` | pandoc 或 markdown+reportlab | 独立的 MD→PDF 功能 |
 
 ## 注意事项

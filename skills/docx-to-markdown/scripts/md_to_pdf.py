@@ -11,9 +11,11 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
+from xml.sax.saxutils import escape
 
 
 def _pick_chinese_font() -> str:
@@ -269,12 +271,12 @@ def convert_md_to_pdf(input_file: str, output_file: Optional[str] = None) -> str
     story = []
     for item_type, text in parser.content:
         if item_type in heading_style_map:
-            story.append(Paragraph(text, heading_style_map[item_type]))
+            story.append(Paragraph(escape(text), heading_style_map[item_type]))
             story.append(Spacer(1, 0.3 * cm if item_type == "h1" else 0.2 * cm))
         elif item_type == "bullet":
-            story.append(Paragraph("• " + text, bullet_style))
+            story.append(Paragraph("• " + escape(text), bullet_style))
         elif item_type == "paragraph":
-            story.append(Paragraph(text, normal_style))
+            story.append(Paragraph(escape(text), normal_style))
             story.append(Spacer(1, 0.2 * cm))
         elif item_type == "code":
             story.append(Preformatted(text, code_style))
@@ -288,18 +290,38 @@ def convert_md_to_pdf_with_pandoc(input_file: str, output_file: str):
     cmd = ["pandoc", input_file, "-o", output_file]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return
     except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or "").strip()
-        raise RuntimeError(f"pandoc 转换失败: {stderr or e}") from e
+        first_err = (e.stderr or "").strip()
+
+    # 默认 pdflatex 引擎无法排版中文。若系统有 xelatex，
+    # 依次尝试常见 CJK 字体重试（不存在的字体会失败并尝试下一个）。
+    if shutil.which("xelatex"):
+        for font in ("PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", "SimSun"):
+            retry = cmd + ["--pdf-engine=xelatex", "-V", f"CJKmainfont={font}"]
+            try:
+                subprocess.run(retry, check=True, capture_output=True, text=True)
+                return
+            except subprocess.CalledProcessError:
+                continue
+
+    raise RuntimeError(f"pandoc 转换失败: {first_err or '未知错误'}")
 
 
 def run_conversion(input_file: str, output_file: str, engine: str) -> str:
     # 独立脚本模式：优先使用系统 pandoc（无 Python 三方依赖）
     if engine in {"auto", "pandoc"}:
         if shutil.which("pandoc"):
-            convert_md_to_pdf_with_pandoc(input_file, output_file)
-            return "pandoc"
-        if engine == "pandoc":
+            if engine == "pandoc":
+                convert_md_to_pdf_with_pandoc(input_file, output_file)
+                return "pandoc"
+            # auto 模式下 pandoc 失败时回退到 Python 引擎，而不是直接报错
+            try:
+                convert_md_to_pdf_with_pandoc(input_file, output_file)
+                return "pandoc"
+            except RuntimeError as e:
+                print(f"⚠️ pandoc 转换失败，回退到 Python 引擎: {e}", file=sys.stderr)
+        elif engine == "pandoc":
             raise RuntimeError("未找到 pandoc，请先安装 pandoc，或改用 --engine python。")
 
     # Python 回退模式：仅当用户环境已有 markdown/reportlab 时可用

@@ -1,4 +1,8 @@
+# 核心依赖（DOCX -> Markdown 转换必需）
 mammoth
 openpyxl
+
+# 可选依赖（仅 md_to_pdf.py --engine python 时需要；
+# 若系统已安装 pandoc，可不装以下两个包）
 markdown
 reportlab

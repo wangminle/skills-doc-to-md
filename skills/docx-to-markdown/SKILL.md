@@ -1,9 +1,11 @@
 ---
 name: docx-to-markdown
-description: "Convert DOCX to Markdown with embedded Excel table conversion and image extraction. Use when (1) converting .docx files to Markdown, especially those containing embedded Excel spreadsheets, (2) extracting images from Word documents to local files with relative paths, (3) batch processing multiple DOCX files, (4) optionally converting Markdown to PDF with Chinese font support."
+description: "Convert DOCX to Markdown with embedded Excel table conversion and image extraction. Use when (1) converting .docx files to Markdown, especially those containing embedded Excel spreadsheets, (2) extracting images from Word documents to local files with relative paths, (3) batch processing multiple DOCX files, (4) optionally converting Markdown to PDF with Chinese font support. 中文场景：Word 转 Markdown、提取图片、嵌入 Excel 表格转 Markdown、批量转换 docx、Markdown 转 PDF。"
 ---
 
 # DOCX to Markdown Converter
+
+![Version](https://img.shields.io/badge/version-0.1.5-blue)
 
 Convert Word documents to Markdown with full support for images, embedded Excel tables, and batch processing.
 
@@ -69,11 +71,12 @@ python scripts/md_to_pdf.py <input.md> [output.pdf] [--engine auto|pandoc|python
 If output path is omitted, PDF is saved in the same directory as the input file.
 
 `md_to_pdf.py` is standalone and works independently from this skill:
-- `--engine auto` (default): prefer system `pandoc`, fallback to Python renderer
-- `--engine pandoc`: force pandoc
+- `--engine auto` (default): prefer system `pandoc`; if pandoc fails (e.g. default pdflatex cannot render Chinese), automatically retries with `xelatex` + CJK fonts, then falls back to Python renderer
+- `--engine pandoc`: force pandoc (raises on failure, no fallback)
 - `--engine python`: force Python renderer (`pip install markdown reportlab`)
 
 > If pandoc is available, it often produces better results.
+> The Python renderer escapes all text before passing to reportlab, so content with `<`, `>`, `&` is safe.
 
 ## Key Features
 
@@ -102,8 +105,8 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 ### Image Handling
 
 - Extracts all images from `word/media/`
-- Auto-detects true image format (PNG/JPEG/GIF/WEBP/BMP) regardless of extension
-- Saves with corrected extensions
+- Auto-detects true image format (PNG/JPEG/GIF/WEBP/BMP/TIFF/WMF/EMF) regardless of extension
+- Saves with corrected extensions; unrecognized formats keep their original extension instead of being mislabeled as PNG
 - Prevents overwrite on corrected-name collisions by appending short hash suffix
 - Uses relative paths (`assets/image.png`) in Markdown
 

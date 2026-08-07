@@ -87,7 +87,7 @@ output/
 
 #### `detect_image_format(image_data)`
 
-通过文件头检测图片真实格式。
+通过文件头检测图片真实格式；无法识别时返回 `None`（调用方保留原扩展名，避免误标为 `.png` 损坏文件）。
 
 **支持格式：**
 - PNG (magic: `\x89PNG\r\n\x1a\n`)
@@ -95,6 +95,9 @@ output/
 - GIF (magic: `GIF87a` / `GIF89a`)
 - WEBP (magic: `RIFF...WEBP`)
 - BMP (magic: `BM`)
+- TIFF (magic: `II*\x00` / `MM\x00*`)
+- WMF (magic: `\xd7\xcd\xc6\x9a`，placeable header)
+- EMF (magic: offset 40 处为 ` EMF`)
 
 #### `html_to_markdown(html, heading_level_map=None)`
 
@@ -246,13 +249,13 @@ python scripts/md_to_pdf.py document.md output.pdf --engine python
 #### `run_conversion(input_file, output_file, engine)`
 
 **引擎策略：**
-1. `auto`：先尝试 `pandoc`，不可用则回退 Python 渲染
-2. `pandoc`：强制使用 pandoc
+1. `auto`：先尝试 `pandoc`；若 pandoc 失败（如默认 pdflatex 无法排版中文），自动用 `xelatex` 依次尝试 PingFang SC / Noto Sans CJK SC / Microsoft YaHei / SimSun 字体重试；若仍失败或无 pandoc，回退 Python 渲染引擎
+2. `pandoc`：强制使用 pandoc（失败直接抛异常，不回退）
 3. `python`：强制使用 Python 渲染（需安装 `markdown` + `reportlab`）
 
 ### 中文字体支持
 
-自动检测系统字体：
+**Python 引擎**：自动检测系统字体并注册：
 
 | 系统 | 字体路径 |
 |-----|---------|
@@ -261,6 +264,18 @@ python scripts/md_to_pdf.py document.md output.pdf --engine python
 | Windows | `C:/Windows/Fonts/msyh.ttc` |
 
 如果系统字体无法注册，会自动回退到 ReportLab 内置的 CID 字体（如 `STSong-Light`）。
+
+**pandoc 引擎**：默认使用 pdflatex，无法排版中文。脚本检测到失败后，若系统有 `xelatex`，会依次尝试常见 CJK 字体重试：
+1. PingFang SC（macOS）
+2. Noto Sans CJK SC（Linux）
+3. Microsoft YaHei（Windows）
+4. SimSun（Windows 通用）
+
+所有字体均失败时，`auto` 模式回退到 Python 引擎；`pandoc` 模式抛出异常。
+
+### 文本安全
+
+Python 引擎在将文本传入 reportlab `Paragraph` 前统一调用 `xml.sax.saxutils.escape()` 转义 `<`、`>`、`&`，避免含特殊字符的文本（如 `A<B`、`C&D`）被误解析为 XML 标签导致崩溃。`Preformatted`（代码块/表格）不需要转义，reportlab 不对其解析 XML 标签。
 
 ### 样式配置
 
@@ -302,7 +317,13 @@ python scripts/md_to_pdf.py document.md output.pdf --engine python
 
 ### Q: PDF 中文显示为方块？
 
-确保系统有支持的中文字体。脚本会依次尝试系统字体并回退到 ReportLab 内置 CID 字体（如 `STSong-Light`）。
+**Python 引擎**：确保系统有支持的中文字体。脚本会依次尝试系统字体并回退到 ReportLab 内置 CID 字体（如 `STSong-Light`）。
+
+**pandoc 引擎**：默认 pdflatex 无法排版中文。`auto` 模式下脚本会自动切换到 `xelatex` 并尝试 CJK 字体；若使用 `--engine pandoc` 且 pandoc 失败，请确认系统已安装 `xelatex`（TeX Live / MacTeX / MiKTeX），或改用 `--engine auto` 让脚本自动回退。
+
+### Q: Markdown 含 `<` 或 `&` 等字符，转 PDF 时崩溃？
+
+已修复。Python 引擎在传入 reportlab 前统一 `escape()`，含 `A<B`、`C&D` 等文本可正常输出 PDF。pandoc 引擎无此问题。
 
 ### Q: 批量转换时某些文件失败？
 
