@@ -5,27 +5,350 @@
 """
 
 import hashlib
+import json
 import logging
 import math
 import os
 import sys
 import zipfile
 import re
-import xml.etree.ElementTree as ET
 import io
 import unicodedata
 from html import unescape
 from html.parser import HTMLParser
 from collections import defaultdict
 import posixpath
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# XML 解析统一入口：安装了 defusedxml 时防御实体膨胀/外部实体等 XML 攻击，
+# 未安装自动回退标准库 xml.etree（功能等价，仅防护降级）。
+try:
+    from defusedxml.ElementTree import fromstring as _safe_xml_fromstring
+except ImportError:
+    from xml.etree.ElementTree import fromstring as _safe_xml_fromstring
 
 
 _FORBIDDEN_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]')
 _WHITESPACE_RE = re.compile(r"\s+")
 _QUOTE_CHARS = '"“”‘’‚‛„‟«»‹›'
+
+
+class DocxSecurityError(ValueError):
+    """输入 DOCX 触发资源耗尽防线（zip bomb / 超大资源）。
+
+    继承 ValueError 以兼容既有 except ValueError 处理；调用方可精确区分
+    “安全拒绝”与普通格式/转换错误——安全拒绝表示输入恶意或异常，
+    不可降级重试（若降级重试会绕过防线）。
+    """
+
+
+# 资源耗尽防线阈值。集中为 dict 便于测试注入与按需收紧。
+DOCX_SECURITY_LIMITS = {
+    "total_uncompressed": 500 * 1024 * 1024,    # ZIP 总解压上限
+    "entry_uncompressed": 100 * 1024 * 1024,    # 单 entry 解压上限
+    "entry_ratio": 100,                         # 单 entry 压缩比上限
+    "total_ratio": 100,                         # 总压缩比上限
+    "total_ratio_min_compressed": 1024 * 1024,  # 总压缩比仅对压缩后 >1MB 的包判定
+    "image_count": 500,                         # word/media 图片数量上限
+    "image_file_size": 20 * 1024 * 1024,        # 单图文件大小上限
+    "image_pixels": 50_000_000,                 # 单图像素上限（解压炸弹检测）
+    "embedded_excel_size": 50 * 1024 * 1024,    # 嵌入 Excel 大小上限
+}
+
+# 批处理跳过判定用的完成标记文件名（JSON，记录源文件 SHA-256）
+SENTINEL_FILENAME = ".converted"
+
+
+def _fmt_bytes(size: int) -> str:
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024 * 1024):.1f}GB"
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MB"
+    return f"{size / 1024:.1f}KB"
+
+
+def validate_docx_zip_security(zip_ref: zipfile.ZipFile) -> None:
+    """解压前依据 ZIP 中央目录元数据做资源耗尽防线校验。
+
+    只读 compress_size/file_size 等声明值，不解压条目内容；超限抛
+    DocxSecurityError。实际读取条目时另由 read_zip_entry_bounded /
+    _read_media_image 在真实解压路径上兜底，防元数据谎报。
+    """
+    limits = DOCX_SECURITY_LIMITS
+    total_compressed = 0
+    total_uncompressed = 0
+    image_count = 0
+
+    for info in zip_ref.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename
+        compressed = info.compress_size
+        uncompressed = info.file_size
+        total_compressed += compressed
+        total_uncompressed += uncompressed
+
+        if uncompressed > limits["entry_uncompressed"]:
+            raise DocxSecurityError(
+                f"ZIP 条目解压后超过单文件上限 {_fmt_bytes(limits['entry_uncompressed'])}: "
+                f"{name}（{_fmt_bytes(uncompressed)}）"
+            )
+        if compressed > 0 and uncompressed > compressed * limits["entry_ratio"]:
+            raise DocxSecurityError(
+                f"ZIP 条目压缩比超过 {limits['entry_ratio']}x: {name}"
+            )
+
+        if name.startswith("word/media/"):
+            image_count += 1
+            if uncompressed > limits["image_file_size"]:
+                raise DocxSecurityError(
+                    f"图片超过单图大小上限 {_fmt_bytes(limits['image_file_size'])}: {name}"
+                )
+        if name.startswith("word/embeddings/") and name.lower().endswith(".xlsx"):
+            if uncompressed > limits["embedded_excel_size"]:
+                raise DocxSecurityError(
+                    f"嵌入 Excel 超过大小上限 {_fmt_bytes(limits['embedded_excel_size'])}: {name}"
+                )
+
+    if image_count > limits["image_count"]:
+        raise DocxSecurityError(f"图片数量超过上限 {limits['image_count']}: 实际 {image_count} 张")
+    if total_uncompressed > limits["total_uncompressed"]:
+        raise DocxSecurityError(
+            f"ZIP 总解压大小超过上限 {_fmt_bytes(limits['total_uncompressed'])}: "
+            f"实际 {_fmt_bytes(total_uncompressed)}"
+        )
+    if total_compressed > limits["total_ratio_min_compressed"]:
+        if total_uncompressed > total_compressed * limits["total_ratio"]:
+            raise DocxSecurityError(
+                f"ZIP 总压缩比超过 {limits['total_ratio']}x: "
+                f"{_fmt_bytes(total_uncompressed)}/{_fmt_bytes(total_compressed)}"
+            )
+
+
+def read_zip_entry_bounded(zip_ref: zipfile.ZipFile, name: str, max_bytes: int) -> bytes:
+    """带实际上限的条目读取：边解压边计数，超过 max_bytes 立即中止。
+
+    validate_docx_zip_security 依赖 ZIP 声明值，本函数在真实解压路径上
+    再兜一道底，防止中央目录元数据与实际数据不一致的恶意构造。
+    """
+    chunks = []
+    total = 0
+    with zip_ref.open(name) as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise DocxSecurityError(
+                    f"ZIP 条目实际解压超过上限 {_fmt_bytes(max_bytes)}: {name}"
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if len(data) < 24 or data[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+_JPEG_SOF_MARKERS = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+
+
+def _jpeg_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    i = 2
+    length = len(data)
+    while i + 4 <= length:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker in (0xD8, 0xD9, 0xDA):  # SOI/EOI/SOS：SOF 应在 SOS 之前出现
+            return None
+        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        if seg_len < 2:
+            return None
+        if marker in _JPEG_SOF_MARKERS and i + 9 <= length:
+            height = int.from_bytes(data[i + 5:i + 7], "big")
+            width = int.from_bytes(data[i + 7:i + 9], "big")
+            return width, height
+        i += 2 + seg_len
+    return None
+
+
+def _gif_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if len(data) < 10:
+        return None
+    return int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little")
+
+
+def _bmp_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if len(data) < 26:
+        return None
+    width = int.from_bytes(data[18:22], "little", signed=True)
+    height = abs(int.from_bytes(data[22:26], "little", signed=True))
+    return width, height
+
+
+def _webp_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if len(data) < 30:
+        return None
+    chunk = data[12:16]
+    if chunk == b"VP8X":
+        # 扩展格式：画布宽高各 24bit，存储的是实际值-1
+        return (int.from_bytes(data[24:27], "little") + 1,
+                int.from_bytes(data[27:30], "little") + 1)
+    if chunk == b"VP8 ":
+        # 有损格式：keyframe 宽高各 14bit
+        return (int.from_bytes(data[26:28], "little") & 0x3FFF,
+                int.from_bytes(data[28:30], "little") & 0x3FFF)
+    if chunk == b"VP8L" and len(data) >= 25:
+        # 无损格式：签名字节后宽高各 14bit，存储的是实际值-1
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    return None
+
+
+def _tiff_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    if len(data) < 8:
+        return None
+    if data[:2] == b"II":
+        endian = "little"
+    elif data[:2] == b"MM":
+        endian = "big"
+    else:
+        return None
+    ifd_offset = int.from_bytes(data[4:8], endian)
+    if ifd_offset + 2 > len(data):
+        return None
+    entry_count = int.from_bytes(data[ifd_offset:ifd_offset + 2], endian)
+    width = height = None
+    for idx in range(entry_count):
+        base = ifd_offset + 2 + idx * 12
+        if base + 12 > len(data):
+            break
+        tag = int.from_bytes(data[base:base + 2], endian)
+        if tag not in (256, 257):  # ImageWidth / ImageLength
+            continue
+        vtype = int.from_bytes(data[base + 2:base + 4], endian)
+        raw = data[base + 8:base + 12]
+        if vtype == 3:  # SHORT
+            value = int.from_bytes(raw[:2], endian)
+        elif vtype == 4:  # LONG
+            value = int.from_bytes(raw[:4], endian)
+        elif vtype in (16, 17):  # LONG8 / SLONG8
+            value = int.from_bytes(raw[:8], endian)
+        else:
+            continue
+        if tag == 256:
+            width = value
+        else:
+            height = value
+    if width and height:
+        return width, height
+    return None
+
+
+def image_pixel_count(image_data: bytes) -> Optional[int]:
+    """从图片头部解析宽高并返回像素数（宽×高）；无法解析返回 None。
+
+    用于解压炸弹（decompression bomb）检测：仅需头部几十字节即可判定，
+    不解码像素数据。WMF/EMF 等矢量格式无固定位图像素，返回 None。
+    """
+    data = image_data or b""
+    dims: Optional[Tuple[int, int]] = None
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        dims = _png_dimensions(data)
+    elif data[:2] == b'\xff\xd8':
+        dims = _jpeg_dimensions(data)
+    elif data[:6] in (b'GIF87a', b'GIF89a'):
+        dims = _gif_dimensions(data)
+    elif data[:2] == b'BM':
+        dims = _bmp_dimensions(data)
+    elif data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        dims = _webp_dimensions(data)
+    elif data[:4] in (b'II*\x00', b'MM\x00*'):
+        dims = _tiff_dimensions(data)
+    if not dims:
+        return None
+    width, height = dims
+    if width <= 0 or height <= 0:
+        return None
+    return width * height
+
+
+def _read_media_image(zip_ref: zipfile.ZipFile, name: str) -> bytes:
+    """读取 word/media 图片并执行大小/像素防线（真实解压路径的兜底）。"""
+    limits = DOCX_SECURITY_LIMITS
+    image_data = read_zip_entry_bounded(zip_ref, name, limits["image_file_size"])
+    pixels = image_pixel_count(image_data)
+    if pixels is not None and pixels > limits["image_pixels"]:
+        raise DocxSecurityError(
+            f"图片像素超过上限 {limits['image_pixels']}: {name}（{pixels} 像素）"
+        )
+    return image_data
+
+
+def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
+    """流式计算文件 SHA-256，避免大文件一次性读入内存。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_conversion_sentinel(final_output_dir: str, folder_name: str, source_sha256: str) -> None:
+    """原子写入转换完成标记（tmp + rename），记录输出目录名与源文件哈希。
+
+    批处理据此判断“输出完整且与当前源一致”；仅转换全部成功后调用。
+    标记写失败不影响本次转换结果，仅意味着批处理下次会重转。
+    """
+    sentinel_path = os.path.join(final_output_dir, SENTINEL_FILENAME)
+    tmp_path = sentinel_path + ".tmp"
+    payload = json.dumps(
+        {"folder_name": folder_name, "source_sha256": source_sha256},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, sentinel_path)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        logger.warning("写入完成标记失败: %s", sentinel_path, exc_info=True)
+
+
+def read_conversion_sentinel(directory: str) -> Optional[Dict[str, str]]:
+    """读取完成标记；缺失/损坏/旧格式（纯文本等非 JSON 对象）返回 None。"""
+    sentinel_path = os.path.join(directory, SENTINEL_FILENAME)
+    try:
+        with open(sentinel_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    folder_name = data.get("folder_name")
+    source_sha256 = data.get("source_sha256")
+    if not isinstance(folder_name, str) or not folder_name:
+        return None
+    if not isinstance(source_sha256, str) or not source_sha256:
+        return None
+    return {"folder_name": folder_name, "source_sha256": source_sha256}
 
 
 def _normalize_markdown_cell_text(value: str) -> str:
@@ -401,17 +724,23 @@ def promote_leading_bold_title(markdown: str) -> str:
 
 def sanitize_stem(stem: str) -> str:
     raw = stem  # 保留原始值用于 hash
-    stem = unicodedata.normalize("NFKC", stem or "")
+    normalized = unicodedata.normalize("NFKC", raw or "")
+    # NFKC 归一化（如全角→半角）不加 hash：中文文档场景过于普遍，
+    # 由此产生的罕见碰撞由 sentinel 的源哈希校验兜底（不一致即重转）。
+    no_quotes = normalized
     for ch in _QUOTE_CHARS:
-        stem = stem.replace(ch, "")
-    stem = _FORBIDDEN_FILENAME_CHARS_RE.sub("_", stem)
-    stem = _WHITESPACE_RE.sub(" ", stem).strip()
+        no_quotes = no_quotes.replace(ch, "")
+    substituted = _FORBIDDEN_FILENAME_CHARS_RE.sub("_", no_quotes)
+    # 引号删除或非法字符替换是强丢失映射（如 a:b 与 a_b 同映射），
+    # 需附加 hash 防止不同原始名称共享同一输出目录
+    lossy = no_quotes != normalized or substituted != no_quotes
+    stem = _WHITESPACE_RE.sub(" ", substituted).strip()
     stem = stem.strip(". ").strip()
     if not stem:
         return "document"
-    if len(stem) <= 120:
+    if len(stem) <= 120 and not lossy:
         return stem
-    # 截断时附加原始全名的短 hash，避免不同长文件名映射到同一输出目录
+    # 清洗发生丢失或超长截断时，附加原始全名的短 hash，避免不同文件名映射到同一输出目录
     suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     return f"{stem[:111]}_{suffix}"
 
@@ -450,7 +779,7 @@ def extract_heading_level_map(docx_path: str) -> Dict[str, int]:
     level_map: Dict[str, int] = {}
     try:
         with zipfile.ZipFile(docx_path, "r") as zip_ref:
-            doc_xml = ET.fromstring(zip_ref.read("word/document.xml"))
+            doc_xml = _safe_xml_fromstring(zip_ref.read("word/document.xml"))
         for p in doc_xml.findall(f".//{tag_p}"):
             bm = p.find(f".//{tag_bm}")
             if bm is None:
@@ -509,7 +838,7 @@ def parse_relationships(docx_path):
     with zipfile.ZipFile(docx_path, 'r') as zip_ref:
         try:
             rels_content = zip_ref.read('word/_rels/document.xml.rels')
-            rels_root = ET.fromstring(rels_content)
+            rels_root = _safe_xml_fromstring(rels_content)
             for rel in rels_root.findall(f'.//{{{NS_REL}}}Relationship'):
                 rid = rel.get('Id')
                 rel_type = rel.get('Type', '').split('/')[-1]
@@ -527,7 +856,7 @@ def parse_relationships(docx_path):
 
         try:
             doc_xml = zip_ref.read('word/document.xml')
-            doc_root = ET.fromstring(doc_xml)
+            doc_root = _safe_xml_fromstring(doc_xml)
 
             # 查找所有 <w:object> 节点（可能嵌套在 mc:AlternateContent 等下面）
             for obj_node in doc_root.iter(f'{{{NS_W}}}object'):
@@ -734,7 +1063,9 @@ def extract_content_from_docx(docx_path, assets_dir):
         for file_info in zip_ref.filelist:
             if file_info.filename.startswith('word/embeddings/') and file_info.filename.lower().endswith('.xlsx'):
                 excel_file = file_info.filename
-                xlsx_data = zip_ref.read(file_info.filename)
+                xlsx_data = read_zip_entry_bounded(
+                    zip_ref, excel_file, DOCX_SECURITY_LIMITS["embedded_excel_size"]
+                )
 
                 markdown_table = excel_to_markdown(xlsx_data)
                 if markdown_table:
@@ -750,7 +1081,7 @@ def extract_content_from_docx(docx_path, assets_dir):
                 continue
             if preview_path not in zip_ref.namelist():
                 continue
-            preview_data = zip_ref.read(preview_path)
+            preview_data = _read_media_image(zip_ref, preview_path)
             digest = hashlib.sha256(preview_data).hexdigest()
             table_queue_by_hash[digest].append(table_md)
             table_repeat_by_hash[digest] = table_md
@@ -766,8 +1097,8 @@ def extract_content_from_docx(docx_path, assets_dir):
                 if file_info.filename in table_preview_paths:
                     continue
                 
-                # 普通图片，直接提取
-                image_data = zip_ref.read(file_info.filename)
+                # 普通图片，直接提取（读取路径上执行大小/像素防线）
+                image_data = _read_media_image(zip_ref, file_info.filename)
                 digest = hashlib.sha256(image_data).hexdigest()
                 
                 # 检测真实的图片格式并修正扩展名；无法识别时保留原扩展名，
@@ -816,7 +1147,7 @@ def extract_textbox_content(docx_path: str) -> List[str]:
     blocks: List[str] = []
     try:
         with zipfile.ZipFile(docx_path, "r") as zf:
-            doc_xml = ET.fromstring(zf.read("word/document.xml"))
+            doc_xml = _safe_xml_fromstring(zf.read("word/document.xml"))
 
         for txbx_tag in (tag_txbx, tag_txbx_wps):
             for txbx in doc_xml.iter(txbx_tag):
@@ -849,7 +1180,7 @@ def extract_math_text(docx_path: str) -> List[str]:
     formulas: List[str] = []
     try:
         with zipfile.ZipFile(docx_path, "r") as zf:
-            doc_xml = ET.fromstring(zf.read("word/document.xml"))
+            doc_xml = _safe_xml_fromstring(zf.read("word/document.xml"))
 
         seen = set()
         for parent_tag in (tag_omath_para, tag_omath):
@@ -882,12 +1213,20 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
     """
     
     # 先校验输入，避免 BadZipFile 直接中断并泄漏底层异常。
+    # 安全校验（DocxSecurityError）在结构校验之后执行：结构非法报格式错误，
+    # 结构合法但资源超限报安全错误。二者均为 ValueError 子类，上层可按需
+    # 区分——安全错误表示输入恶意/异常，不可降级重试。
     try:
         with zipfile.ZipFile(docx_path, "r") as zip_ref:
             if "word/document.xml" not in zip_ref.namelist():
                 raise ValueError(f"输入文件不是有效的 DOCX（缺少 word/document.xml）: {docx_path}")
+            validate_docx_zip_security(zip_ref)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"输入文件不是有效的 DOCX/ZIP: {docx_path}") from exc
+
+    # 记录源文件哈希：转换全部成功后写入 .converted sentinel，
+    # 供批处理判断“输出完整且与当前源一致”（源变更后自动重转）。
+    source_sha256 = sha256_file(docx_path)
 
     # 获取文件名（不含扩展名）
     base_name = os.path.splitext(os.path.basename(docx_path))[0]
@@ -1015,10 +1354,12 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True):
             logger.info("追加了 %d 个数学公式", len(missing_math))
 
     md_path = os.path.join(final_output_dir, f"{folder_name}.md")
-    
+
     with open(md_path, 'w', encoding='utf-8') as f:
         f.write(markdown)
-    
+
+    write_conversion_sentinel(final_output_dir, folder_name, source_sha256)
+
     logger.info("转换完成: %s", md_path)
     return md_path
 
@@ -1190,5 +1531,12 @@ if __name__ == '__main__':
     if not os.path.exists(docx_path):
         logger.error("文件不存在 - %s", docx_path)
         sys.exit(1)
-    
-    convert_docx_to_markdown(docx_path, output_dir)
+
+    try:
+        convert_docx_to_markdown(docx_path, output_dir)
+    except DocxSecurityError as exc:
+        logger.error("安全拒绝（输入恶意或资源超限，不重试）: %s", exc)
+        sys.exit(2)
+    except ValueError as exc:
+        logger.error("输入错误: %s", exc)
+        sys.exit(2)

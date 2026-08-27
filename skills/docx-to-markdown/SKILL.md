@@ -5,7 +5,7 @@ description: "Convert DOCX to Markdown with embedded Excel table conversion and 
 
 # DOCX to Markdown Converter
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue)
+![Version](https://img.shields.io/badge/version-0.1.6-blue)
 
 Convert Word documents to Markdown with full support for images, embedded Excel tables, and batch processing.
 
@@ -56,11 +56,21 @@ When user mentions converting multiple DOCX files, use batch conversion:
 ```bash
 python scripts/batch_convert.py <source_dir> <output_dir>
 
+# Per-document timeout (default 300s; <=0 disables; skipped on Windows)
+python scripts/batch_convert.py <source_dir> <output_dir> --timeout 120
+
 # Force re-convert even if output already exists
 python scripts/batch_convert.py <source_dir> <output_dir> --force
 ```
 
 Each DOCX creates a separate folder with its MD file and assets.
+
+**Skip semantics (SHA-256 sentinel)**: a document is skipped only when the output
+folder + MD + valid `.converted` sentinel are all present AND the sentinel's
+recorded source SHA-256 matches the current source file. Changed sources are
+re-converted automatically — no `--force` needed. Legacy plain-text sentinels are
+treated as invalid (re-converted). Failed conversions (including timeouts and
+security rejections) clean up the half-finished output folder.
 
 ### Markdown to PDF (Optional)
 
@@ -113,7 +123,42 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 ### Output Naming Safety
 
 - Cleans invalid filename characters and quote variants
-- For very long document names, truncates safely and appends a short hash suffix to avoid directory collisions
+- When cleaning actually replaces/removes characters (e.g. `a:b` → `a_b`) or truncates over-long names, a short hash of the original name is appended so different source names never share one output folder
+- Pure NFKC normalization (full-width → half-width, common in Chinese documents) does not append a hash; its rare collisions are covered by the sentinel hash check
+
+### Security: Resource-Exhaustion Defense (Malicious DOCX)
+
+Before decompression, the ZIP structure is validated against
+`DOCX_SECURITY_LIMITS` (module-level dict, tunable):
+
+| Limit | Default |
+|-------|---------|
+| Total uncompressed size | 500 MB |
+| Single entry uncompressed | 100 MB |
+| Single entry compression ratio | 100x |
+| Total compression ratio (only judged when compressed total > 1 MB) | 100x |
+| Image count (`word/media/`) | 500 |
+| Single image file size | 20 MB |
+| Single image pixels (decompression-bomb check via header parsing, no decode) | 50,000,000 |
+| Embedded Excel size | 50 MB |
+
+Violations raise `DocxSecurityError(ValueError)`. It subclasses `ValueError`
+for compatibility, but callers can catch it precisely: a security rejection
+means the input is malicious/abnormal and must NOT be retried or degraded to
+a fallback path. Actual reads are additionally bounded at decompression time
+(`read_zip_entry_bounded`) to defend against lying ZIP metadata.
+
+XML parsing goes through `defusedxml` when installed (falls back to stdlib
+`xml.etree` otherwise); `defusedxml` is listed as an optional dependency.
+
+### Batch Reliability
+
+- **Per-document timeout**: `--timeout` (default 300s) via POSIX `signal.alarm`;
+  `<=0` disables. Windows (no SIGALRM) and non-main threads degrade to no timeout.
+  The previous signal handler is always restored.
+- **SHA-256 `.converted` sentinel** (atomic tmp+rename JSON) — see Batch Conversion above
+- **Half-finished cleanup**: failed conversions and untrusted pre-existing outputs
+  (missing/invalid/mismatched sentinel) are removed and re-converted
 
 ### Additional Enhancements
 
@@ -143,10 +188,12 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 ```bash
 pip install -r requirements.txt
 # Installs: mammoth, openpyxl (core) + markdown, reportlab (optional PDF engine)
+#           + defusedxml (optional hardened XML parsing)
 ```
 
 - **mammoth** + **openpyxl**: DOCX→Markdown 核心转换（必需）
 - **markdown** + **reportlab**: Python 内置 PDF 渲染引擎（仅 `md_to_pdf.py --engine python` 时使用；若系统有 pandoc 则可不装）
+- **defusedxml**: 增强解析 DOCX 内 XML 的安全性（防实体膨胀/外部实体；未安装自动回退标准库，功能不受影响）
 
 ## Scripts Reference
 

@@ -6,3 +6,7 @@ openpyxl
 # 若系统已安装 pandoc，可不装以下两个包）
 markdown
 reportlab
+
+# 可选依赖（增强 XML 解析安全，防御实体膨胀/外部实体等攻击；
+# 未安装自动回退标准库 xml.etree，功能不受影响）
+defusedxml

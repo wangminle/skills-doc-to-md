@@ -1,6 +1,6 @@
 # skills-docstomd-withpics
 
-![Version](https://img.shields.io/badge/version-0.1.5-blue)
+![Version](https://img.shields.io/badge/version-0.1.6-blue)
 
 本仓库用于发布一个 Codex Skill：`docx-to-markdown`（`skills/docx-to-markdown/SKILL.md`），用于将 Word 的 `.docx` 文档转换为 Markdown，并提取图片/转换嵌入的 Excel 表格。
 
@@ -24,9 +24,11 @@
 - 文本框/浮动元素：自动提取 DOCX 中 mammoth 忽略的 `<w:txbxContent>` 文本框内容
 - 数学公式基础提取：检测 OMML 数学公式并提取纯文本，以 `$$ ... $$` 标记输出
 - 残留预览文本清理：表格替换后自动移除「点击图片可查看完整电子表格」等残留说明
-- 批处理：批量转换目录下多个 DOCX，支持 `--force` 强制重新转换
+- 批处理：批量转换目录下多个 DOCX，支持 `--force` 强制重新转换与 `--timeout` 单文档超时（默认 300 秒）
+- SHA-256 完成标记：转换成功后写入 `.converted`（记录源哈希），源文件变更后批处理自动重转；失败/半成品输出自动清理
+- 恶意 DOCX 资源耗尽防线：解压前校验 ZIP（总解压 500MB、单 entry 100MB、压缩比 100x、图片数量/大小/像素上限），超限抛 `DocxSecurityError`（继承 `ValueError`，但不可降级重试）；实际读取再按真实解压量兜底；可选 defusedxml 加固 XML 解析
 - `.md → .pdf`（可选）：独立脚本，优先 pandoc；pandoc 失败时自动切换 xelatex + CJK 字体，最终回退 Python 引擎；Python 引擎对含 `<>` `&` 的文本做了 escape 安全处理
-- 文件名稳健：自动清理非法字符；超长文件名会附加短 hash，避免不同文件名截断后冲突
+- 文件名稳健：自动清理非法字符；清洗发生字符替换/超长截断时附加源文件名短 hash，避免不同文件名映射到同一输出目录
 
 ## 快速开始
 
@@ -43,6 +45,9 @@ python scripts/convert_docx.py <input.docx> <output_dir>
 
 # 批量
 python scripts/batch_convert.py <source_dir> <output_dir>
+
+# 批量（单文档超时 120 秒，默认 300 秒）
+python scripts/batch_convert.py <source_dir> <output_dir> --timeout 120
 
 # 批量（强制重新转换已存在的输出）
 python scripts/batch_convert.py <source_dir> <output_dir> --force
@@ -71,7 +76,7 @@ output_dir/
 
 | 文件 | 包含 | 用途 |
 |------|------|------|
-| `requirements.txt` | mammoth, openpyxl（核心）；markdown, reportlab（可选） | 核心转换 + 可选 PDF 功能 |
+| `requirements.txt` | mammoth, openpyxl（核心）；markdown, reportlab, defusedxml（可选） | 核心转换 + 可选 PDF / XML 安全加固 |
 | `scripts/md_to_pdf.py` | pandoc 或 markdown+reportlab | 独立的 MD→PDF 功能 |
 
 ## 注意事项
@@ -89,7 +94,9 @@ output_dir/
 - 脚注：mammoth 输出的脚注 HTML 会自动转为 `[^N]` / `[^N]: text` 语法。
 - 文本框：mammoth 忽略的 `<w:txbxContent>` 内容会被提取，以引用块追加至文档末尾。
 - 数学公式：OMML `<m:oMath>` 中的纯文本会被提取并以 `$$ ... $$` 标记输出（完整 OMML→LaTeX 需额外工具）。
-- 批量转换使用 `--force` 参数可强制重新转换已存在的输出目录。
+- 批量转换默认只在「输出 + `.converted` 标记 + 源哈希一致」时跳过；源文件更新后自动重转，`--force` 用于强制全量重建。
+- 单文档转换默认 300 秒超时（`--timeout`，Windows 自动跳过）；失败与安全拒绝都会清理半成品输出目录。
+- 恶意/异常 DOCX（zip bomb、超大图片、超高压缩比等）会被 `DocxSecurityError` 拒绝——该异常继承 `ValueError`，但语义上是安全拒绝，调用方不可降级重试。
 - 修正图片扩展名后若发生重名冲突，脚本会自动追加 hash 后缀，避免覆盖已提取文件。
 - 输入文件若不是有效 DOCX/ZIP（或缺少 `word/document.xml`），会抛出明确错误信息。
 - 如果只需要简单的 DOCX 转 MD（无嵌入 Excel），推荐直接使用 `pandoc --extract-media ./media input.docx -o output.md`。
