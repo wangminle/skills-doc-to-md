@@ -5,7 +5,7 @@ description: "Convert DOCX to Markdown with embedded Excel table conversion and 
 
 # DOCX to Markdown Converter
 
-![Version](https://img.shields.io/badge/version-0.1.6-blue)
+![Version](https://img.shields.io/badge/version-0.1.7-blue)
 
 Convert Word documents to Markdown with full support for images, embedded Excel tables, and batch processing.
 
@@ -37,6 +37,12 @@ Install dependencies first: `pip install -r requirements.txt`
 
 ```bash
 python scripts/convert_docx.py <input.docx> <output_directory>
+
+# Custom output folder / md name (useful for web-upload scenarios)
+python scripts/convert_docx.py <input.docx> <output_directory> --output-name <name>
+
+# Degrade instead of rejecting documents with oversized attachments
+python scripts/convert_docx.py <input.docx> <output_directory> --on-limit skip
 ```
 
 Output structure (auto-creates subfolder named after the document):
@@ -59,6 +65,9 @@ python scripts/batch_convert.py <source_dir> <output_dir>
 # Per-document timeout (default 300s; <=0 disables; skipped on Windows)
 python scripts/batch_convert.py <source_dir> <output_dir> --timeout 120
 
+# Degrade oversized attachments per document instead of failing the whole file
+python scripts/batch_convert.py <source_dir> <output_dir> --on-limit skip
+
 # Force re-convert even if output already exists
 python scripts/batch_convert.py <source_dir> <output_dir> --force
 ```
@@ -67,7 +76,7 @@ Each DOCX creates a separate folder with its MD file and assets.
 
 **Skip semantics (SHA-256 sentinel)**: a document is skipped only when the output
 folder + MD + valid `.converted` sentinel are all present AND the sentinel's
-recorded source SHA-256 matches the current source file. Changed sources are
+recorded source SHA-256 and `on_limit` match the current request. Changed sources or policies are
 re-converted automatically — no `--force` needed. Legacy plain-text sentinels are
 treated as invalid (re-converted). Failed conversions (including timeouts and
 security rejections) clean up the half-finished output folder.
@@ -125,11 +134,24 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 - Cleans invalid filename characters and quote variants
 - When cleaning actually replaces/removes characters (e.g. `a:b` → `a_b`) or truncates over-long names, a short hash of the original name is appended so different source names never share one output folder
 - Pure NFKC normalization (full-width → half-width, common in Chinese documents) does not append a hash; its rare collisions are covered by the sentinel hash check
+- `output_name` (Python API) / `--output-name` (CLI) overrides the naming with the same
+  sanitization — the output folder, `.md` filename and sentinel `folder_name` all follow it
+  consistently; a trailing `.docx` is removed case-insensitively while dotted version names
+  such as `V2.4` are preserved; the sentinel still records the real source SHA-256
 
 ### Security: Resource-Exhaustion Defense (Malicious DOCX)
 
 Before decompression, the ZIP structure is validated against
-`DOCX_SECURITY_LIMITS` (module-level dict, tunable):
+`DOCX_SECURITY_LIMITS` (module-level dict, tunable). Limits are enforced in
+two layers:
+
+**Layer 1 — unconditional rejection (any mode)**: malicious ZIP
+characteristics raise `DocxSecurityError(ValueError)` and the whole document
+is rejected. It subclasses `ValueError` for compatibility, but callers can
+catch it precisely: a security rejection means the input is malicious/abnormal
+and must NOT be retried or degraded to a fallback path.
+Duplicate ZIP entry names are rejected as ambiguous input so they cannot bypass
+per-entry resource accounting.
 
 | Limit | Default |
 |-------|---------|
@@ -137,16 +159,33 @@ Before decompression, the ZIP structure is validated against
 | Single entry uncompressed | 100 MB |
 | Single entry compression ratio | 100x |
 | Total compression ratio (only judged when compressed total > 1 MB) | 100x |
-| Image count (`word/media/`) | 500 |
-| Single image file size | 20 MB |
-| Single image pixels (decompression-bomb check via header parsing, no decode) | 50,000,000 |
-| Embedded Excel size | 50 MB |
 
-Violations raise `DocxSecurityError(ValueError)`. It subclasses `ValueError`
-for compatibility, but callers can catch it precisely: a security rejection
-means the input is malicious/abnormal and must NOT be retried or degraded to
-a fallback path. Actual reads are additionally bounded at decompression time
+**Layer 2 — degradable resource limits**: raise
+`ResourceLimitExceeded(DocxSecurityError)`; with the default
+`on_limit="reject"` they behave exactly like Layer 1 (whole-document
+rejection). With `on_limit="skip"` (Python API / `--on-limit skip` on both
+CLIs) only the offending resource is skipped and the rest of the document is
+converted:
+
+| Limit | Default | skip behavior |
+|-------|---------|---------------|
+| Image count (`word/media/`) | 500 | images beyond the quota are skipped |
+| Single image file size | 20 MB | image not written; visible note in place |
+| Single image pixels (decompression-bomb check via header parsing) | 50,000,000 | image not written; visible note in place |
+| Embedded Excel size | 50 MB | table not converted; body text kept |
+
+Skip-mode guarantees: all reads stay byte-bounded (including inside the
+mammoth image callback, which re-applies the same limits and image-count
+quota so skipped images can never be re-written through the fallback path);
+skipped images appear as `*【图片已跳过：…】*` notes instead of referencing
+non-existent files; a summary of skipped resources is logged. Zip-bomb
+characteristics (Layer 1) are still rejected wholesale in skip mode —
+skipping never applies to malicious inputs.
+
+Actual reads are additionally bounded at decompression time
 (`read_zip_entry_bounded`) to defend against lying ZIP metadata.
+Embedded XLSX files are ZIP containers too, so their inner entries are
+validated with the same unconditional ZIP-bomb rules before `openpyxl` parses them.
 
 XML parsing goes through `defusedxml` when installed (falls back to stdlib
 `xml.etree` otherwise); `defusedxml` is listed as an optional dependency.
@@ -156,7 +195,11 @@ XML parsing goes through `defusedxml` when installed (falls back to stdlib
 - **Per-document timeout**: `--timeout` (default 300s) via POSIX `signal.alarm`;
   `<=0` disables. Windows (no SIGALRM) and non-main threads degrade to no timeout.
   The previous signal handler is always restored.
-- **SHA-256 `.converted` sentinel** (atomic tmp+rename JSON) — see Batch Conversion above
+- **`--on-limit reject|skip`** (default `reject`): pass-through of the degradation
+  policy above — `skip` lets normal documents with oversized attachments convert
+  (attachment dropped with a visible note); zip-bomb inputs still count as failures
+- **SHA-256 `.converted` sentinel** (atomic tmp+rename JSON) — records source hash and
+  `on_limit`; V0.1.6 JSON sentinels without the policy are interpreted as `reject`
 - **Half-finished cleanup**: failed conversions and untrusted pre-existing outputs
   (missing/invalid/mismatched sentinel) are removed and re-converted
 

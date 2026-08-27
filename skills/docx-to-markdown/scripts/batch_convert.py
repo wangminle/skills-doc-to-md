@@ -5,7 +5,8 @@
 
 跳过与清理语义：
   - 跳过需满足：输出目录 + md + 有效 `.converted` sentinel 齐备，
-    且 sentinel 记录的源 SHA-256 与当前源文件一致（源变更自动重转，无需 --force）
+    且 sentinel 记录的源 SHA-256 与当前源文件、on_limit 与当前请求一致
+    （源或策略变更自动重转，无需 --force）
   - 转换失败（含超时/安全拒绝）时清理输出目录，避免半成品被误判为已完成
 """
 
@@ -21,12 +22,13 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
-from convert_docx import (
+from convert_docx import (  # noqa: E402  sys.path 调整必须先于本 import
     DocxSecurityError,
     convert_docx_to_markdown,
     read_conversion_sentinel,
     sanitize_stem,
     sha256_file,
+    validate_on_limit,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,8 +53,8 @@ def _cleanup_failed_output(target_dir):
         remove_path(target_dir)
 
 
-def _is_output_complete(target_dir, folder_name, docx_path):
-    """判断输出是否可信：目录 + md + 有效 sentinel，且源哈希与当前源一致。
+def _is_output_complete(target_dir, folder_name, docx_path, on_limit="reject"):
+    """判断输出是否可信：目录 + md + sentinel，且源哈希与策略一致。
 
     源哈希仅在 sentinel 存在且目录名匹配时才计算，避免对未转换文件白做 IO。
     """
@@ -64,6 +66,8 @@ def _is_output_complete(target_dir, folder_name, docx_path):
     if not sentinel:
         return False
     if sentinel.get("folder_name") != folder_name:
+        return False
+    if sentinel.get("on_limit", "reject") != on_limit:
         return False
     return sentinel.get("source_sha256") == sha256_file(docx_path)
 
@@ -95,7 +99,8 @@ def _run_with_timeout(func, timeout_seconds):
         signal.signal(signal.SIGALRM, old_handler)
 
 
-def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_SECONDS):
+def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_SECONDS,
+                  on_limit="reject"):
     """批量转换目录下的所有docx文件
 
     Args:
@@ -104,7 +109,13 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
         force: 为 True 时强制重新转换已存在的输出目录
         timeout: 单文档转换超时秒数（默认 300；<=0 不限制，
             仅 POSIX 主线程生效，Windows 自动跳过）
+        on_limit: 透传给 convert_docx_to_markdown 的资源超限处置。
+            "reject"（默认）超限整篇拒绝计失败；"skip" 仅跳过超限资源继续
+            转换（带超大附件的正常文档也能转出）。ZIP bomb 等恶意特征
+            任何模式下都计失败不重试
     """
+
+    validate_on_limit(on_limit)
 
     # 合并两种大小写扩展名并去重（macOS 大小写不敏感时 *.docx 已包含 .DOCX）
     seen = set()
@@ -137,7 +148,9 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
         logger.info("[%d/%d] 正在处理: %s", i, len(docx_files), base_name)
 
         # 检查是否已经完整转换且源未变更（--force 时跳过此检查）
-        if not force and _is_output_complete(target_dir, folder_name, docx_path):
+        if not force and _is_output_complete(
+            target_dir, folder_name, docx_path, on_limit=on_limit
+        ):
             logger.info("  已完成且源文件未变更，跳过（源变更会自动重转；强制重转用 --force）")
             skip_count += 1
             continue
@@ -150,7 +163,8 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
 
         try:
             _run_with_timeout(
-                lambda: convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True),
+                lambda: convert_docx_to_markdown(
+                    docx_path, output_dir, create_subfolder=True, on_limit=on_limit),
                 timeout,
             )
             logger.info("  完成")
@@ -183,6 +197,10 @@ if __name__ == '__main__':
     parser.add_argument("--force", action="store_true", help="强制重新转换已存在的输出目录")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS,
                         help="单文档转换超时秒数（默认 300；<=0 不限制；Windows 无 SIGALRM 自动跳过）")
+    parser.add_argument("--on-limit", choices=("reject", "skip"), default="reject",
+                        help="资源超限处置：reject 整篇拒绝计失败（默认）；skip 仅跳过超限资源"
+                             "继续转换（ZIP bomb 等恶意特征仍计失败）")
     args = parser.parse_args()
 
-    batch_convert(args.source_dir, args.output_dir, force=args.force, timeout=args.timeout)
+    batch_convert(args.source_dir, args.output_dir, force=args.force,
+                  timeout=args.timeout, on_limit=args.on_limit)

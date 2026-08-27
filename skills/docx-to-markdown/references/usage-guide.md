@@ -23,12 +23,20 @@
 
 ```bash
 # 在 skills/docx-to-markdown/ 目录下执行
-python scripts/convert_docx.py <docx文件路径> <输出目录>
+python scripts/convert_docx.py <docx文件路径> <输出目录> [选项]
 ```
+
+**选项：**
+- `--output-name <名称>`：自定义输出子文件夹与 `.md` 文件名（末尾 `.docx`
+  自动去除，默认用源文件名）。适合 Web 上传等需要以用户原始文件名命名的场景
+- `--on-limit reject|skip`：资源超限处置，默认 `reject` 整篇拒绝；
+  `skip` 仅跳过超限资源继续转换（见下文「资源超限处置策略」）
 
 **示例：**
 ```bash
 python scripts/convert_docx.py report.docx ./output
+python scripts/convert_docx.py upload1234.docx ./output --output-name 用户原始文件名
+python scripts/convert_docx.py report.docx ./output --on-limit skip
 ```
 
 **输出（自动创建以文件名命名的子文件夹）：**
@@ -44,7 +52,7 @@ output/
 
 ### 核心函数
 
-#### `convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True)`
+#### `convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, output_name=None, on_limit="reject")`
 
 主入口函数，执行完整的转换流程。
 
@@ -52,20 +60,35 @@ output/
 - `docx_path`: DOCX 文件路径
 - `output_dir`: 输出目录路径
 - `create_subfolder`: 是否在输出目录下创建以文件名命名的子文件夹（默认 True）
+- `output_name`: 自定义输出命名（默认 None 用源文件名）。末尾 `.docx`（大小写不敏感）
+  会自动去除；其他点号后缀保留，因此 `需求V2.4` 不会被截成 `需求V2`。之后经
+  `sanitize_stem` 清洗后统一用于子文件夹名、`.md` 文件名与 sentinel 的
+  `folder_name`，三处保持一致；sentinel 仍记录真实源文件 SHA-256。空白值抛
+  `ValueError`
+- `on_limit`: 可降级资源超限处置，`"reject"`（默认，保持既有行为）或
+  `"skip"`（见下文「资源超限处置策略」）；其他值抛 `ValueError`
 
 **返回：** 生成的 Markdown 文件路径
 
 **异常：**
 - 当输入文件不是有效 DOCX/ZIP，或缺少 `word/document.xml` 时抛出 `ValueError`
-- 当输入触发资源耗尽防线（zip bomb / 超大资源，见下文安全防线）时抛出 `DocxSecurityError`
+- 当输入触发资源耗尽防线（zip bomb / 超大资源，见下文安全防线）时抛出
+  `DocxSecurityError`；其中可降级资源超限实际抛其子类
+  `ResourceLimitExceeded`（`reject` 模式下处置一致）
 
 **完成标记：** 转换全部成功后会在输出目录原子写入 `.converted` JSON
-（`{"folder_name": ..., "source_sha256": ...}`），批处理据此判断输出完整且与当前源一致。
+（`{"folder_name": ..., "source_sha256": ..., "on_limit": ...}`），批处理据此判断
+输出完整且与当前源及资源处置策略一致。V0.1.6 缺少策略字段的 JSON sentinel
+按 `reject` 兼容读取；策略变化会自动重转。
 
 #### 安全防线（资源耗尽防御）
 
 解压前依据 ZIP 中央目录元数据校验，实际读取时再按真实解压量兜底。阈值集中在
-模块级 `DOCX_SECURITY_LIMITS` dict 中，可按需收紧或测试注入：
+模块级 `DOCX_SECURITY_LIMITS` dict 中，可按需收紧或测试注入。防线分两层：
+
+**第一层：恶意特征，无条件整篇拒绝（`on_limit` 不影响）**
+
+重复 ZIP 条目名也会被拒绝，避免同名条目的不唯一解压语义绕过计数。
 
 | 防线 | 默认阈值 |
 |------|---------|
@@ -73,6 +96,11 @@ output/
 | 单 entry 解压上限 | 100 MB |
 | 单 entry 压缩比 | 100x |
 | 总压缩比（仅当压缩后总大小 > 1MB 时判定，避免小文件舍入误伤） | 100x |
+
+**第二层：可降级资源限制（抛 `ResourceLimitExceeded`，`skip` 模式下降级跳过）**
+
+| 防线 | 默认阈值 |
+|------|---------|
 | 图片数量（`word/media/`） | 500 |
 | 单图文件大小 | 20 MB |
 | 单图像素（解压炸弹检测） | 5000 万 |
@@ -80,29 +108,58 @@ output/
 
 `DocxSecurityError(ValueError)`：继承 `ValueError` 以兼容既有异常处理，但调用方
 应精确捕获本类——安全拒绝表示输入恶意/异常，**不可降级重试**（降级会绕过防线）。
+`ResourceLimitExceeded(DocxSecurityError)`：可降级资源超限专用子类，默认 `reject`
+模式下与基类处置完全一致。
+
+#### 资源超限处置策略（`on_limit`）
+
+`convert_docx_to_markdown(..., on_limit="reject"|"skip")`、单文件 CLI
+`--on-limit`、批处理 CLI `--on-limit` 三入口统一，默认均为 `reject`：
+
+| 模式 | 行为 |
+|------|------|
+| `reject`（默认） | 四类可降级资源任一超限即抛 `DocxSecurityError`（子类 `ResourceLimitExceeded`）整篇拒绝，与历史行为完全一致 |
+| `skip` | 仅跳过超限资源继续转换：超大嵌入 Excel 不转表格但正文保留；超限图片不落盘，原位置输出可见说明 `*【图片已跳过：单图超过大小上限】*` 等；图片超过数量配额后不再提取。转换结束汇总输出跳过清单日志 |
+
+`skip` 模式的边界与保证：
+- 第一层恶意特征（总量/单 entry/压缩比）**依旧整篇拒绝**，跳过策略只对
+  “带超大附件的正常文档”生效，对恶意输入不提供任何放宽
+- 所有读取路径保持实际上限（含 mammoth 图片回调的有界读取），不会为跳过
+  而退化为无界读取
+- mammoth 回调复用同一套大小/像素防线与图片数量配额：提取阶段跳过的超限
+  图片不可能经回调兜底写盘“复活”
+- 文档无超限资源时，`skip` 与 `reject` 产生的 Markdown 正文与
+  `assets` 资源文件一致（`.converted` 会分别记录实际策略）
+
+场景建议：服务端无人值守批处理用默认 `reject`（严格）；面向用户的单文档
+转换（如 Web 上传）用 `skip`，避免“带一个 60MB 附表的正常文档转不出来”。
 
 XML 解析统一走 `_safe_xml_fromstring` 入口：安装了 `defusedxml` 时防御实体膨胀/
 外部实体攻击，未安装自动回退标准库 `xml.etree`（功能等价，仅防护降级）。
 
-#### `validate_docx_zip_security(zip_ref)`
+#### `validate_docx_zip_security(zip_ref, on_limit="reject")`
 
-对已打开的 `zipfile.ZipFile` 执行上表安全校验（只读声明值不解压）。超限抛
-`DocxSecurityError`。`convert_docx_to_markdown` 在结构校验后自动调用。
+对已打开的 `zipfile.ZipFile` 执行上表安全校验（只读声明值不解压）。第一层
+超限抛 `DocxSecurityError`；第二层超限在 `reject` 模式抛
+`ResourceLimitExceeded`，`skip` 模式不抛（改由提取阶段按真实读取逐项跳过）。
+`convert_docx_to_markdown` 在结构校验后自动调用。
 
 #### `image_pixel_count(image_data)`
 
 从图片头部解析宽高并返回像素数（宽×高），用于解压炸弹检测；仅读头部几十字节、
 不解码像素。支持 PNG/JPEG/GIF/BMP/WEBP/TIFF；WMF/EMF 等矢量格式及未知格式返回 `None`。
 
-#### `read_zip_entry_bounded(zip_ref, name, max_bytes)`
+#### `read_zip_entry_bounded(zip_ref, name, max_bytes, error_cls=DocxSecurityError)`
 
-带实际上限的条目读取：边解压边计数，超过 `max_bytes` 立即抛 `DocxSecurityError`，
-防御中央目录元数据与实际数据不一致的恶意构造。
+带实际上限的条目读取：边解压边计数，超过 `max_bytes` 立即抛 `error_cls`，
+防御中央目录元数据与实际数据不一致的恶意构造。可降级资源（图片/嵌入
+Excel）传 `error_cls=ResourceLimitExceeded` 供 `skip` 模式精确捕获。
 
 #### `sha256_file(path)` / `write_conversion_sentinel(...)` / `read_conversion_sentinel(directory)`
 
 完成标记相关工具：流式计算源文件 SHA-256；原子写入（tmp + rename）与读取
-`.converted` JSON。旧格式（纯文本）或损坏的 sentinel 读取时返回 `None`。
+`.converted` JSON，记录目录名、源 SHA-256 与 `on_limit`。旧格式（纯文本）、
+损坏内容或未知策略返回 `None`；V0.1.6 JSON 缺少策略字段时按 `reject` 返回。
 
 **输出结构：**
 - 当 `create_subfolder=True` 时：`output_dir/文件名/文件名.md` + `assets/`
@@ -124,6 +181,8 @@ XML 解析统一走 `_safe_xml_fromstring` 入口：安装了 `defusedxml` 时�
 #### `excel_to_markdown(xlsx_data)`
 
 将 Excel 二进制数据转换为 Markdown 表格（仅依赖 openpyxl，无需 pandas）。
+调用 openpyxl 前会先校验 XLSX 内层 ZIP 的单条目解压量与压缩比，
+嵌套 XLSX zip bomb 在 `skip` 模式下也会无条件拒绝整篇文档。
 
 自动清理全空行和全空列，补齐短行。
 
@@ -211,13 +270,14 @@ mammoth 通常忽略文本框/形状中的内容，此函数作为补充提取�
 ### 命令行用法
 
 ```bash
-python scripts/batch_convert.py [源目录] [输出目录] [--force] [--timeout 秒数]
+python scripts/batch_convert.py [源目录] [输出目录] [--force] [--timeout 秒数] [--on-limit reject|skip]
 ```
 
 **默认值：**
 - 源目录: `1-Reference`
 - 输出目录: `2-Temp`
 - 超时: `300` 秒/文档
+- 资源超限处置: `reject`（整篇拒绝计失败）
 
 **示例：**
 ```bash
@@ -226,13 +286,16 @@ python scripts/batch_convert.py ./documents ./markdown_output
 # 单文档超时 120 秒
 python scripts/batch_convert.py ./documents ./markdown_output --timeout 120
 
+# 超大附件降级跳过（正文保留，恶意输入仍计失败）
+python scripts/batch_convert.py ./documents ./markdown_output --on-limit skip
+
 # 强制重新转换已存在的输出目录
 python scripts/batch_convert.py ./documents ./markdown_output --force
 ```
 
 ### 核心函数
 
-#### `batch_convert(source_dir, output_dir, force=False, timeout=300)`
+#### `batch_convert(source_dir, output_dir, force=False, timeout=300, on_limit="reject")`
 
 **参数：**
 - `source_dir`: 源文件目录
@@ -240,12 +303,15 @@ python scripts/batch_convert.py ./documents ./markdown_output --force
 - `force`: 为 `True` 时强制重新转换已存在的输出目录（删除旧目录后重新生成）
 - `timeout`: 单文档转换超时秒数（`<=0` 不限制；仅 POSIX 主线程生效，
   Windows 无 SIGALRM 自动跳过，非主线程安装失败降级为无超时）
+- `on_limit`: 透传给 `convert_docx_to_markdown` 的资源超限处置。默认 `reject`
+  超限整篇拒绝计失败；`skip` 仅跳过超限资源继续转换。批处理按源文件名命名
+  输出（不使用 `output_name`），`skip` 模式下 sentinel 与跳过语义均不受影响
 
 ### 特性
 
 1. **SHA-256 完成标记跳过** - 跳过需满足：输出目录 + md + 有效 `.converted`
-   sentinel 齐备，且 sentinel 记录的源 SHA-256 与当前源文件一致；
-   **源文件变更后自动重转，无需 `--force`**。旧格式（纯文本）sentinel 视为无效，
+   sentinel 齐备，且 sentinel 记录的源 SHA-256 与当前源文件、`on_limit` 与当前
+   请求一致；**源文件或策略变更后自动重转，无需 `--force`**。旧格式（纯文本）sentinel 视为无效，
    按半成品清理后重转
 2. **`--force` 模式** - 删除已有输出目录后重新转换，适合强制全量重建
 3. **单文档超时** - `--timeout`（默认 300 秒）基于 POSIX `signal.alarm` 实现，
@@ -259,6 +325,8 @@ python scripts/batch_convert.py ./documents ./markdown_output --force
 8. **大小写去重** - macOS 等大小写不敏感文件系统上自动去重 `.docx`/`.DOCX`
 
 > 安全拒绝（`DocxSecurityError`）在批处理中计为失败并清理输出，不降级不重试。
+> `--on-limit skip` 只放宽可降级资源（超大附件）的处置；ZIP bomb 等恶意特征
+> 在任何模式下都计失败。
 
 ### 输出结构
 
@@ -402,6 +470,27 @@ SHA-256），源文件变更后哈希不一致会**自动清理重转**，无需
 ```bash
 python scripts/batch_convert.py ./documents ./output --force
 ```
+
+### Q: 带超大附件的正常文档转不出来怎么办？
+
+例如文档里嵌了一个 60MB 的 Excel（默认上限 50MB）或一张超大图片，默认策略
+会整篇拒绝。如果希望“丢附件保正文”，显式选择降级模式：
+```bash
+python scripts/convert_docx.py input.docx ./output --on-limit skip
+python scripts/batch_convert.py ./documents ./output --on-limit skip
+```
+超限资源被跳过并在 Markdown 原位置留下 `*【图片已跳过：…】*` 可见说明，
+转换结束输出跳过清单日志。注意：zip bomb 等恶意特征不受此开关影响，
+依旧整篇拒绝；默认值为 `reject`，不会静默降级。
+
+### Q: 想用上传时的原始文件名命名输出怎么办？
+
+```bash
+python scripts/convert_docx.py upload1234.docx ./output --output-name 用户原始文件名
+```
+或 Python API `convert_docx_to_markdown(path, out_dir, output_name="用户原始文件名")`。
+命名统一经 `sanitize_stem` 清洗，输出目录、`.md` 文件名与 sentinel 的
+`folder_name` 三处一致；sentinel 仍记录真实源文件 SHA-256。
 
 ### Q: 恶意/异常 DOCX 会把进程拖死吗？
 

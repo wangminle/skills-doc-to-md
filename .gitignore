@@ -40,7 +40,10 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
-tests/
+# 测试脚本入库；测试夹具（真实内部文档）与转换输出不入库
+tests/*.docx
+tests/*.DOCX
+tests/output/
 htmlcov/
 .tox/
 .nox/
