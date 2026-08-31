@@ -1182,7 +1182,7 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
         table_preview_paths = set()
         media_paths = [
             info.filename for info in zip_ref.filelist
-            if info.filename.startswith('word/media/')
+            if info.filename.startswith('word/media/') and not info.is_dir()
         ]
         allowed_media_paths = set(media_paths)
         if skip_mode:
@@ -1244,9 +1244,9 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
             table_repeat_by_hash[digest] = table_md
             logger.info("转换Excel为表格: %s", excel_path)
 
-        # 处理图片
+        # 处理图片（显式目录 entry 不算图片，否则会写出空 assets/.png 并错占配额）
         for file_info in zip_ref.filelist:
-            if file_info.filename.startswith('word/media/'):
+            if file_info.filename.startswith('word/media/') and not file_info.is_dir():
                 image_name = os.path.basename(file_info.filename)
 
                 # 检查这个图片是否是Excel的预览图

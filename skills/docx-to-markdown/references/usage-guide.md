@@ -305,7 +305,11 @@ python scripts/batch_convert.py ./documents ./markdown_output --force
   Windows 无 SIGALRM 自动跳过，非主线程安装失败降级为无超时）
 - `on_limit`: 透传给 `convert_docx_to_markdown` 的资源超限处置。默认 `reject`
   超限整篇拒绝计失败；`skip` 仅跳过超限资源继续转换。批处理按源文件名命名
-  输出（不使用 `output_name`），`skip` 模式下 sentinel 与跳过语义均不受影响
+  输出（仅消歧时透传 `output_name`），`skip` 模式下 sentinel 与跳过语义均不受影响
+
+**返回值：** `{"success": 成功数, "skipped": 跳过数, "failed": 失败数}`，
+任意文档转换失败时 `failed > 0`，CLI 据此返回退出码 1（全部成功/跳过为 0，
+空目录视为成功），供 CI/自动化判定批次结果。
 
 ### 特性
 
@@ -322,7 +326,13 @@ python scripts/batch_convert.py ./documents ./markdown_output --force
 6. **统计汇总** - 结束时显示成功/跳过/失败数量
 7. **文件名清理与防冲突** - 自动清理非法字符；清洗发生字符替换/超长截断时
    附加源文件名短 hash，防止不同原始名称映射到同一输出目录
-8. **大小写去重** - macOS 等大小写不敏感文件系统上自动去重 `.docx`/`.DOCX`
+8. **批内同名消歧** - 两个源文件名清洗后相同时（如 NFKC 归一化的 `A` 与
+   全角 `Ａ`），后来者附加原始名短 hash（如 `A_30757541`），避免共用输出
+   目录互相覆盖；分配只依赖文件名，跨批次稳定，不影响增量跳过
+9. **扩展名大小写不敏感** - `.docx`/`.DOCX`/`.Docx`/`.doCx` 等全部匹配；
+   macOS 等大小写不敏感文件系统上的重复条目自动去重；名为 `*.docx` 的
+   目录不是待转文档
+10. **失败退出码** - 任一文档失败时 CLI 退出码为 1，供 CI/自动化判定
 
 > 安全拒绝（`DocxSecurityError`）在批处理中计为失败并清理输出，不降级不重试。
 > `--on-limit skip` 只放宽可降级资源（超大附件）的处置；ZIP bomb 等恶意特征

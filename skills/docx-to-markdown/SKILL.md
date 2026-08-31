@@ -5,7 +5,7 @@ description: "Convert DOCX to Markdown with embedded Excel table conversion and 
 
 # DOCX to Markdown Converter
 
-![Version](https://img.shields.io/badge/version-0.1.7-blue)
+![Version](https://img.shields.io/badge/version-0.1.8-blue)
 
 Convert Word documents to Markdown with full support for images, embedded Excel tables, and batch processing.
 
@@ -72,7 +72,12 @@ python scripts/batch_convert.py <source_dir> <output_dir> --on-limit skip
 python scripts/batch_convert.py <source_dir> <output_dir> --force
 ```
 
-Each DOCX creates a separate folder with its MD file and assets.
+Each DOCX creates a separate folder with its MD file and assets. Extension
+matching is case-insensitive (`.docx`/`.DOCX`/`.Docx`); if two source names
+clean to the same folder (e.g. `A` vs full-width `Ａ`), the later one gets a
+short-hash suffix (e.g. `A_30757541`) so outputs never overwrite each other.
+The CLI exits with code 1 when any document fails (0 when all succeed or are
+skipped), for CI/automation.
 
 **Skip semantics (SHA-256 sentinel)**: a document is skipped only when the output
 folder + MD + valid `.converted` sentinel are all present AND the sentinel's
@@ -123,7 +128,7 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 
 ### Image Handling
 
-- Extracts all images from `word/media/`
+- Extracts all images from `word/media/` (explicit directory entries in the ZIP are not images)
 - Auto-detects true image format (PNG/JPEG/GIF/WEBP/BMP/TIFF/WMF/EMF) regardless of extension
 - Saves with corrected extensions; unrecognized formats keep their original extension instead of being mislabeled as PNG
 - Prevents overwrite on corrected-name collisions by appending short hash suffix
@@ -133,7 +138,7 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
 
 - Cleans invalid filename characters and quote variants
 - When cleaning actually replaces/removes characters (e.g. `a:b` → `a_b`) or truncates over-long names, a short hash of the original name is appended so different source names never share one output folder
-- Pure NFKC normalization (full-width → half-width, common in Chinese documents) does not append a hash; its rare collisions are covered by the sentinel hash check
+- Pure NFKC normalization (full-width → half-width, common in Chinese documents) does not append a hash; single-file collisions are covered by the sentinel hash check, and batch mode disambiguates in-batch collisions with a short-hash suffix
 - `output_name` (Python API) / `--output-name` (CLI) overrides the naming with the same
   sanitization — the output folder, `.md` filename and sentinel `folder_name` all follow it
   consistently; a trailing `.docx` is removed case-insensitively while dotted version names

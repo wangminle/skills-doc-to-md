@@ -25,6 +25,11 @@
 | BUG-011 | 修复 | 嵌入 XLSX 仅受 DOCX 外层 entry 大小限制，openpyxl 解析前未校验 XLSX 内层 ZIP bomb | 2026-08-28 00:30 | 2026-08-28 00:40 | 已修复 | `excel_to_markdown` 在 openpyxl 前对 XLSX 内层 ZIP 执行无条件恶意特征校验，`DocxSecurityError` 不再被普通 Excel 转换失败捕获并降级。 |
 | BUG-012 | 修复 | 旧 assets 清理会误删 `create_subfolder=False` 平铺输出中其他文档资源，且预置 assets 符号链接可将清理导向外部目录 | 2026-08-28 00:48 | 2026-08-28 00:50 | 已修复 | 仅对文档独占子目录执行 stale assets 清理；平铺共享模式保留其他资源；转换前拒绝 assets 符号链接或非目录对象。 |
 | BUG-013 | 修复 | ZIP 允许重复 entry 名，同名 `word/media` 可绕过基于路径 set 的图片数量配额 | 2026-08-28 00:55 | 2026-08-28 00:58 | 已修复 | 安全校验对所有 ZIP 条目名去重，发现同名条目无条件抛 `DocxSecurityError`，同时消除 XML/关系文件的不唯一解压语义。 |
+| BUG-014 | 修复 | 批处理中两个源文件名经 NFKC 归一化后相同时共用输出目录，后者删除并覆盖前者结果 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已修复 | 批处理转换前经 `_allocate_unique_folder_names` 统一分配目录名：碰撞时后来者附加原始文件名短 hash（如 `A_30757541`）消歧，仍冲突再加序号；仅依赖文件名故跨批次稳定，增量跳过语义不变。文件：`scripts/batch_convert.py`。 |
+| BUG-015 | 修复 | 批处理 CLI 即使有文档转换失败仍以退出码 0 结束 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已修复 | `batch_convert` 返回 `{"success", "skipped", "failed"}` 统计；CLI 在 `failed > 0` 时 `sys.exit(1)`（空目录视为成功退出 0）。文件：`scripts/batch_convert.py`。 |
+| BUG-016 | 修复 | 批处理只匹配 `.docx` 和 `.DOCX`，会静默漏掉 `.Docx` 等混合大小写扩展名 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已修复 | 文件发现改为 `os.listdir` + 扩展名大小写不敏感匹配，并排除名为 `*.docx` 的目录；保留 realpath 去重与 OSError 容错（对齐原 glob 行为）。文件：`scripts/batch_convert.py`。 |
+| BUG-017 | 修复 | ZIP 中显式的 `word/media/` 目录 entry 被当作空图片提取 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已修复 | `extract_content_from_docx` 的媒体清单与图片提取循环均排除 `ZipInfo.is_dir()`，不再产出 `assets/.png` 伪文件/空内容 hash 映射，skip 模式不再错占图片配额（安全校验层此前已正确跳过目录 entry）。文件：`scripts/convert_docx.py`。 |
+| BUG-018 | 修复 | 批处理 hash 消歧名再与自然输出名碰撞时，最终分配名未透传给转换器，仍会覆盖已有结果 | 2026-08-31 13:00 | 2026-08-31 13:03 | 已修复 | 分配器改为同步跟踪 `candidate` 字符串，`output_name` 始终取产出最终 `folder_name` 的那次候选（满足 `sanitize_stem(output_name) == folder_name`），`_N` 序号推进后不再写回旧目录。三文件复现（`A`/`A_30757541`/`Ａ`）实测各占 `A`、`A_30757541`、`A_30757541_2` 且二轮全跳过。文件：`scripts/batch_convert.py`。 |
 
 ## 调整事项
 
@@ -37,6 +42,10 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | CHK-001 | 检查 | 复核 [[BUG-001]]～[[BUG-003]] 修复是否落地且正确 | 2026-08-07 10:18 | 2026-08-07 10:20 | 已完成 | 源码核对 + 针对性实验：魔数/扩展名、`A<B` PDF、pandoc mock（xelatex 重试与 auto 回退）均通过；27 个回归测试全绿。本机无 pandoc/xelatex，真机中文 PDF 未测。 |
 | CHK-002 | 检查 | 系统审查 issue #2/#3 实现的安全边界、兼容性、缓存语义与干净环境可复现性 | 2026-08-28 00:05 | 2026-08-28 01:01 | 已完成 | 定位并修复 [[BUG-004]]～[[BUG-013]]；确认 ZIP bomb/重复 entry 不受 skip 影响、DOCX/XLSX 内外层读取有界、提取与 Mammoth 共享物理媒体配额且无旁路、重转无旧资源残留，共享 assets 不误删。设计与实施计划见 `docs/plans/2026-08-28-docx-limit-output-*.md`。 |
+| CHK-003 | 检查 | 核查线上 issue #1～#3 是否已实现并回复评论、关闭 | 2026-08-28 16:49 | 2026-08-28 16:49 | 已完成 | #1 资源防线/sentinel/超时（V0.1.6）、#2 on_limit 降级（V0.1.7）、#3 output_name（V0.1.7）均已在代码落地且有配套测试（99 测全绿）；已逐条回复实现详情并全部关闭，当前无 open issue |
+| CHK-004 | 检查 | 全量回归、静态检查及批处理/资源提取边界复核 | 2026-08-31 11:02 | 2026-08-31 11:02 | 已完成 | 99 项 pytest + 2 项 subtest 全绿，`compileall` 与 Ruff 通过；最小实验稳定复现 [[BUG-014]]～[[BUG-017]]。mypy 另报 7 项 TIFF `byteorder` 字面量类型告警，为静态标注问题，未记为运行时 Bug。 |
+| CHK-005 | 检查 | 复核 [[BUG-014]]～[[BUG-017]] 修复实现与回归测试 | 2026-08-31 13:00 | 2026-08-31 13:00 | 已完成 | [[BUG-015]]～[[BUG-017]] 定向用例通过；[[BUG-014]] 的普通 NFKC 双文件碰撞已修复，但二次名称碰撞仍可覆盖，登记为 [[BUG-018]]。全量 `pytest` 为 105 passed + 2 subtests passed，`compileall`、Ruff、`git diff --check` 均通过。 |
+| CHK-006 | 检查 | 复核 [[BUG-018]] 二次名称碰撞修复 | 2026-08-31 14:09 | 2026-08-31 14:09 | 已完成 | 独立端到端复现确认 `A.docx`/`A_30757541.docx`/`Ａ.docx` 分别产出 `A`/`A_30757541`/`A_30757541_2`，sentinel 目录名一致，第二轮全部跳过；7 项相关定向测试与全量 106 项 pytest + 2 项 subtest 通过，`compileall`、Ruff、`git diff --check` 均通过，未发现新问题。 |
 
 ## 测试数据
 
@@ -46,6 +55,8 @@
 | TST-002 | 检查 | 本机安装 pandoc + xelatex 后实测中文 PDF 路径 | 2026-08-07 10:49 | - | 待办 | 验证 [[BUG-003]] 的 xelatex 字体重试与 `auto` 回退在真机可用。 |
 | TST-003 | 检查 | 为 [[DEV-001]]～[[DEV-004]] 补专项单测并全量回归 | 2026-08-27 17:40 | 2026-08-27 17:58 | 已完成 | 新增 `tests/test_docx_security_and_batch.py` 共 37 测（zip 各上限/压缩比门槛、像素炸弹、sentinel 读写与旧格式、批处理跳过/源变更重转/失败清理/超时/handler 恢复、`sanitize_stem` hash 策略）；全套 64 测全绿（2.6s）。另做真机端到端：批处理→跳过→源变更自动重转、CLI 拒绝 500MB 炸弹（exit 2 且无输出残留）。 |
 | TST-004 | 检查 | 为 [[DEV-005]]/[[DEV-006]] 与 [[BUG-004]]～[[BUG-013]] 补专项测试并全量回归 | 2026-08-27 19:10 | 2026-08-28 00:58 | 已完成 | 覆盖 output_name、on_limit 两层防线/API/CLI、策略 sentinel、历史契约、assets 清理/共享/符号链接、超限图片配额前置、同图多引用、重复 ZIP entry、XLSX 内层 ZIP bomb 及干净 clone。最终测试数与干净归档验证见本轮最终验收。 |
+| TST-005 | 检查 | 为 [[BUG-014]]～[[BUG-017]] 补回归测试并全量回归 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已完成 | 新增 6 测：NFKC 同名双目录保留且二轮全跳过、批处理返回值含失败数、CLI 失败退出码 1（子进程实测）、混合大小写扩展名发现、媒体目录 entry 不提取/不占 skip 配额。全套 105 测 + 2 subtests 全绿；临时还原 HEAD 版脚本验证 6 项新测在旧代码上全部失败（判别力确认）；compileall/Ruff/`git diff --check` 通过。 |
+| TST-006 | 检查 | 为 [[BUG-018]] 补二次碰撞回归测试并全量回归 | 2026-08-31 13:00 | 2026-08-31 13:03 | 已完成 | 新增三文件碰撞测试（`A`/`A_<hash>`/`Ａ` 各占独立目录、sentinel folder_name 逐一核对、二轮全跳过）；先按审查复现路径手动验证修复，再换入上一轮 BUG-018 版脚本确认新测失败（判别力确认）。全套 106 测 + 2 subtests 全绿；compileall/Ruff/`git diff --check` 通过。 |
 
 ## 文档维护
 
@@ -56,6 +67,8 @@
 | DOC-003 | 文档 | README / SKILL.md 增加 V0.1.5 版本徽章 | 2026-08-07 11:13 | 2026-08-07 11:14 | 已完成 | 标题下仅增加 `version-0.1.5` shields.io 徽章（不含 build 号）。 |
 | DOC-004 | 文档 | 同步 [[DEV-001]]～[[DEV-004]] 行为说明到 skill 文档 | 2026-08-27 17:40 | 2026-08-27 18:00 | 已完成 | SKILL.md 新增 Security/Batch Reliability 章节、批处理跳过语义与 defusedxml 依赖说明；usage-guide.md 更新 convert_docx 异常与新函数、batch_convert 参数/特性、FAQ（自动重转/恶意 DOCX/超时/defusedxml）；README 功能与注意事项同步；requirements.txt 增加 defusedxml 可选依赖；版本徽章升至 0.1.6。 |
 | DOC-005 | 文档 | 同步 [[DEV-005]]/[[DEV-006]] 行为说明并准备 V0.1.7 | 2026-08-27 19:10 | 2026-08-28 00:24 | 已完成 | README / SKILL.md / usage-guide.md 已同步两层防线、on_limit、output_name、`.docx` 后缀、策略 sentinel 与旧版兼容语义；版本徽章升至 0.1.7。当前改动尚未提交或发布。 |
+| DOC-006 | 文档 | 同步 [[BUG-014]]～[[BUG-017]] 行为说明到 skill 文档 | 2026-08-31 11:02 | 2026-08-31 11:49 | 已完成 | SKILL.md 批处理章节补充扩展名大小写不敏感、批内同名 hash 消歧与失败退出码，Image Handling 标注目录 entry 不算图片，Output Naming 补充批内消歧；usage-guide.md 补 `batch_convert` 返回值/退出码与特性 8～10。版本号未升（属缺陷修复，随下个版本发布）。 |
+| DOC-007 | 文档 | 版本升至 V0.1.8 并全量核对文档与当前行为一致 | 2026-08-31 13:04 | 2026-08-31 15:54 | 已完成 | README.md 与 SKILL.md 版本徽章升至 0.1.8；README 功能列表与注意事项补齐批处理大小写不敏感匹配、批内同名消歧（含 `_N` 序号）、失败退出码 1、媒体目录 entry 不算图片、`batch_convert()` 返回统计等 [[BUG-014]]～[[BUG-018]] 行为（SKILL.md / usage-guide.md 已在 [[DOC-006]] 同步）。核对无残留 0.1.7 引用；描述 V0.1.6 sentinel 兼容语义的历史说明按原样保留。 |
 
 ## 功能开发
 
@@ -72,6 +85,7 @@
 
 | ID | 动作 | 事项 | 发现时间 | 完成时间 | 状态 | 备注 |
 | --- | --- | --- | --- | --- | --- | --- |
+| OPS-001 | 运维 | 同步 3 处用户级 skills 安装到最新版本 V0.1.7 | 2026-08-28 16:53 | 2026-08-28 16:53 | 已完成 | rsync 同步 ~/.claude、~/.codex、~/.cursor 三处，各更新 5 个文件（SKILL.md、usage-guide.md、requirements.txt、batch_convert.py、convert_docx.py）；diff 验证全部一致 |
 
 ## 规划事项
 

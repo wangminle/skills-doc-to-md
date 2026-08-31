@@ -8,14 +8,20 @@
     且 sentinel 记录的源 SHA-256 与当前源文件、on_limit 与当前请求一致
     （源或策略变更自动重转，无需 --force）
   - 转换失败（含超时/安全拒绝）时清理输出目录，避免半成品被误判为已完成
+
+命名与退出码：
+  - 扩展名大小写不敏感匹配（.docx/.DOCX/.Docx 等）
+  - 批内两个文件名清洗后相同时（如 NFKC 归一化的 A 与 Ａ），后来者附加
+    原始名短 hash 消歧，避免共用目录互相覆盖
+  - 任一文档失败时 CLI 退出码为 1，全部成功/跳过为 0
 """
 
+import hashlib
 import logging
 import os
 import shutil
 import signal
 import sys
-import glob
 
 # 支持从同目录或作为模块导入
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -72,6 +78,44 @@ def _is_output_complete(target_dir, folder_name, docx_path, on_limit="reject"):
     return sentinel.get("source_sha256") == sha256_file(docx_path)
 
 
+def _allocate_unique_folder_names(docx_files):
+    """为批内文件分配互不冲突的输出 folder_name。
+
+    sanitize_stem 的 NFKC 归一化（如全角Ａ→半角 A）是有意不加 hash 的弱映射，
+    单文件场景的碰撞由 sentinel 哈希校验兜底；但同一批次内两个源文件若映射到
+    同一目录，后处理者会删除并覆盖先处理者的完整结果，sentinel 无法阻止。
+
+    这里在转换前统一分配：先到者保留自然名，后来者附加原始文件名的短 hash
+    消歧（仅依赖文件名，跨批次稳定，不影响 skip/增量语义）；极端情况下仍
+    冲突则再加序号。返回 [(docx_path, folder_name, output_name)]，
+    output_name 仅在发生消歧时非 None，且必须满足
+    sanitize_stem(output_name) == folder_name——转换器以 output_name 重算
+    目录名，二者不一致时会写回旧目录造成覆盖（含 _N 序号推进的场景）。
+    """
+    used = set()
+    plan = []
+    for docx_path in docx_files:
+        base_name = os.path.splitext(os.path.basename(docx_path))[0]
+        folder_name = sanitize_stem(base_name)
+        output_name = None
+        if folder_name in used:
+            digest = hashlib.sha256(base_name.encode("utf-8")).hexdigest()[:8]
+            candidate_base = f"{folder_name}_{digest}"
+            candidate = candidate_base
+            folder_name = sanitize_stem(candidate)
+            n = 2
+            while folder_name in used:
+                candidate = f"{candidate_base}_{n}"
+                folder_name = sanitize_stem(candidate)
+                n += 1
+            output_name = candidate
+            logger.warning(
+                "  %s 与先前文件的输出名冲突，输出到: %s", base_name, folder_name)
+        used.add(folder_name)
+        plan.append((docx_path, folder_name, output_name))
+    return plan
+
+
 def _run_with_timeout(func, timeout_seconds):
     """POSIX 平台用 SIGALRM 给 func 加超时；不支持的环境降级为直接执行。
 
@@ -113,14 +157,28 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
             "reject"（默认）超限整篇拒绝计失败；"skip" 仅跳过超限资源继续
             转换（带超大附件的正常文档也能转出）。ZIP bomb 等恶意特征
             任何模式下都计失败不重试
+
+    Returns:
+        dict: {"success": 成功数, "skipped": 跳过数, "failed": 失败数}。
+        任意文档转换失败时 failed > 0，CLI 据此返回退出码 1。
     """
 
     validate_on_limit(on_limit)
 
-    # 合并两种大小写扩展名并去重（macOS 大小写不敏感时 *.docx 已包含 .DOCX）
+    # 大小写不敏感匹配 .docx/.DOCX/.Docx 等混合大小写扩展名；
+    # realpath 去重吸收大小写不敏感文件系统（macOS）下的重复条目
+    try:
+        names = sorted(os.listdir(source_dir))
+    except OSError:
+        names = []
     seen = set()
     docx_files = []
-    for path in glob.glob(os.path.join(source_dir, '*.docx')) + glob.glob(os.path.join(source_dir, '*.DOCX')):
+    for name in names:
+        if not name.lower().endswith(".docx"):
+            continue
+        path = os.path.join(source_dir, name)
+        if not os.path.isfile(path):
+            continue
         real = os.path.realpath(path)
         if real not in seen:
             seen.add(real)
@@ -128,7 +186,7 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
 
     if not docx_files:
         logger.warning("在 %s 中没有找到docx文件", source_dir)
-        return
+        return {"success": 0, "skipped": 0, "failed": 0}
 
     logger.info("找到 %d 个docx文件待处理%s", len(docx_files),
                 "（强制重新转换）" if force else "")
@@ -139,10 +197,12 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
 
     os.makedirs(output_dir, exist_ok=True)
 
-    for i, docx_path in enumerate(sorted(docx_files), 1):
-        # 获取文件名（不含扩展名）作为输出文件夹名
+    # 转换前统一分配输出目录名，防止批内 NFKC 等弱映射碰撞互相覆盖
+    plan = _allocate_unique_folder_names(sorted(docx_files))
+
+    for i, (docx_path, folder_name, output_name) in enumerate(plan, 1):
+        # 获取文件名（不含扩展名）用于日志展示
         base_name = os.path.splitext(os.path.basename(docx_path))[0]
-        folder_name = sanitize_stem(base_name)
         target_dir = os.path.join(output_dir, folder_name)
 
         logger.info("[%d/%d] 正在处理: %s", i, len(docx_files), base_name)
@@ -164,7 +224,8 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
         try:
             _run_with_timeout(
                 lambda: convert_docx_to_markdown(
-                    docx_path, output_dir, create_subfolder=True, on_limit=on_limit),
+                    docx_path, output_dir, create_subfolder=True,
+                    output_name=output_name, on_limit=on_limit),
                 timeout,
             )
             logger.info("  完成")
@@ -185,6 +246,7 @@ def batch_convert(source_dir, output_dir, force=False, timeout=DEFAULT_TIMEOUT_S
 
     logger.info("处理完成: 成功 %d 个, 跳过 %d 个, 失败 %d 个",
                 success_count, skip_count, fail_count)
+    return {"success": success_count, "skipped": skip_count, "failed": fail_count}
 
 if __name__ == '__main__':
     import argparse
@@ -202,5 +264,7 @@ if __name__ == '__main__':
                              "继续转换（ZIP bomb 等恶意特征仍计失败）")
     args = parser.parse_args()
 
-    batch_convert(args.source_dir, args.output_dir, force=args.force,
-                  timeout=args.timeout, on_limit=args.on_limit)
+    summary = batch_convert(args.source_dir, args.output_dir, force=args.force,
+                            timeout=args.timeout, on_limit=args.on_limit)
+    # 有文档转换失败时以非零退出码结束，供 CI/自动化判定批次结果
+    sys.exit(1 if summary["failed"] else 0)

@@ -1,6 +1,6 @@
 # skills-docstomd-withpics
 
-![Version](https://img.shields.io/badge/version-0.1.7-blue)
+![Version](https://img.shields.io/badge/version-0.1.8-blue)
 
 本仓库用于发布一个 Codex Skill：`docx-to-markdown`（`skills/docx-to-markdown/SKILL.md`），用于将 Word 的 `.docx` 文档转换为 Markdown，并提取图片/转换嵌入的 Excel 表格。
 
@@ -24,7 +24,7 @@
 - 文本框/浮动元素：自动提取 DOCX 中 mammoth 忽略的 `<w:txbxContent>` 文本框内容
 - 数学公式基础提取：检测 OMML 数学公式并提取纯文本，以 `$$ ... $$` 标记输出
 - 残留预览文本清理：表格替换后自动移除「点击图片可查看完整电子表格」等残留说明
-- 批处理：批量转换目录下多个 DOCX，支持 `--force` 强制重新转换、`--timeout` 单文档超时（默认 300 秒）与 `--on-limit` 资源超限处置
+- 批处理：批量转换目录下多个 DOCX（扩展名大小写不敏感），支持 `--force` 强制重新转换、`--timeout` 单文档超时（默认 300 秒）与 `--on-limit` 资源超限处置；批内文件名清洗后相同时（如 NFKC 归一化的 `A` 与全角 `Ａ`）自动附加短 hash 消歧，输出互不覆盖；任一文档失败时 CLI 退出码 1，供 CI/自动化判定
 - SHA-256 完成标记：转换成功后写入 `.converted`（记录源哈希），源文件变更后批处理自动重转；失败/半成品输出自动清理
 - 恶意 DOCX 资源耗尽防线：解压前校验 ZIP（总解压 500MB、单 entry 100MB、压缩比 100x、图片数量/大小/像素上限），嵌入 XLSX 在交给 openpyxl 前还会独立校验内层 ZIP；超限抛 `DocxSecurityError`（继承 `ValueError`，但不可降级重试）；实际读取再按真实解压量兜底；可选 defusedxml 加固 XML 解析
 - 资源超限可选降级（`on_limit` / `--on-limit`，默认拒绝）：`skip` 模式仅跳过超限资源继续转换——带超大 Excel/图片附件的正常文档也能转出正文，超限图片原位置留可见跳过说明且绝不落盘（mammoth 回调同享防线与配额，无旁路）；zip bomb 等恶意特征任何模式下仍整篇拒绝
@@ -106,6 +106,8 @@ output_dir/
 - 文本框：mammoth 忽略的 `<w:txbxContent>` 内容会被提取，以引用块追加至文档末尾。
 - 数学公式：OMML `<m:oMath>` 中的纯文本会被提取并以 `$$ ... $$` 标记输出（完整 OMML→LaTeX 需额外工具）。
 - 批量转换默认只在「输出 + `.converted` 标记 + 源哈希 + `on_limit` 策略一致」时跳过；源文件或策略变化后自动重转，`--force` 用于强制全量重建。V0.1.6 未记录策略的 JSON sentinel 按 `reject` 兼容读取。
+- 批处理对 `.docx`/`.DOCX`/`.Docx` 等扩展名大小写不敏感；批内两个文件名清洗后相同时，后来者输出到 `原名_hash8`（仍冲突则加序号）目录，互不覆盖。ZIP 中显式的 `word/media/` 目录 entry 不会被当作空图片提取。
+- 批处理任一文档失败（含超时/安全拒绝）时 CLI 退出码为 1；全部成功或跳过为 0。Python API `batch_convert()` 返回 `{"success", "skipped", "failed"}` 统计。
 - 单文档转换默认 300 秒超时（`--timeout`，Windows 自动跳过）；失败与安全拒绝都会清理半成品输出目录。
 - 恶意/异常 DOCX（zip bomb、超大图片、超高压缩比等）会被 `DocxSecurityError` 拒绝——该异常继承 `ValueError`，但语义上是安全拒绝，调用方不可降级重试。
 - 「超大附件」类超限（图片数量/单图大小/像素、嵌入 Excel 大小）可通过 `on_limit="skip"` / `--on-limit skip` 降级为仅跳过该资源：正文保留、超限图片原位置留可见跳过说明、所有读取仍带上限；zip bomb 等恶意特征不受该开关影响，依旧整篇拒绝。默认 `reject` 与历史行为一致。
