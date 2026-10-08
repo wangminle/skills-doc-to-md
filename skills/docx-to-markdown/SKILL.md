@@ -5,7 +5,7 @@ description: "Convert DOCX to Markdown with embedded Excel table conversion and 
 
 # DOCX to Markdown Converter
 
-![Version](https://img.shields.io/badge/version-0.1.8-blue)
+![Version](https://img.shields.io/badge/version-0.1.9-blue)
 
 Convert Word documents to Markdown with full support for images, embedded Excel tables, and batch processing.
 
@@ -126,12 +126,18 @@ Automatically detects Excel spreadsheets embedded in DOCX and converts them to M
   - `> merge_ranges: A1:B2, C3:C5, ...`
   - Preserves original merge scope metadata for downstream parsers
 
+### Table & Text Fidelity
+
+- Word HTML tables and embedded-Excel tables serialize through one final escaping layer: backslashes are escaped first and then pipes, so raw cell text like `A\|B` or `A\\|B` stays within a single cell and trailing columns are never lost
+- Literal tag-looking text in cell content (e.g. a `<time>` slot label) is preserved as entities in the Markdown source and stays visible when rendered — never swallowed as raw HTML by Markdown/PDF renderers
+- Nested tables (a `<table>` inside a cell) are flattened to inline escaped text inside the cell, since Markdown pipe tables cannot nest — content is preserved rather than dropped
+
 ### Image Handling
 
-- Extracts all images from `word/media/` (explicit directory entries in the ZIP are not images)
+- Extracts every physical image part: `word/media/` entries plus image-relationship targets of every Mammoth-processed part (document, footnotes, endnotes), which may point anywhere in the package (`word/custom/`, package-root `custom/`) — the same scope as the image-count quota. Zero-byte directory placeholders are excluded from the quota and extraction, even when targeted by image relationships; a body reference shows `图片关系指向空目录` under either policy. Directory-named entries with nonzero content are still rejected by ZIP security validation.
 - Auto-detects true image format (PNG/JPEG/GIF/WEBP/BMP/TIFF/WMF/EMF) regardless of extension
 - Saves with corrected extensions; unrecognized formats keep their original extension instead of being mislabeled as PNG
-- Prevents overwrite on corrected-name collisions by appending short hash suffix
+- On corrected-name collisions, cycles through hash-suffixed and numbered candidates and reuses an existing entry only when it is a regular file with identical bytes — candidates occupied by a different file, symlink or directory are never reused
 - Uses relative paths (`assets/image.png`) in Markdown
 
 ### Output Naming Safety
@@ -174,7 +180,7 @@ converted:
 
 | Limit | Default | skip behavior |
 |-------|---------|---------------|
-| Image count (`word/media/`) | 500 | images beyond the quota are skipped |
+| Image count (physical image parts: `word/media/` entries **plus** image-relationship targets of every Mammoth-processed part — document, footnotes, endnotes — anywhere in the package, e.g. `word/custom/` or package-root `custom/`; targets are counted both literally (as Mammoth reads them, no path normalization) and normalized, so entries with `.`/`..` segments like `word/custom/../image1.png` cannot bypass the quota) | 500 | images beyond the quota are skipped |
 | Single image file size | 20 MB | image not written; visible note in place |
 | Single image pixels (decompression-bomb check via header parsing) | 50,000,000 | image not written; visible note in place |
 | Embedded Excel size | 50 MB | table not converted; body text kept |
@@ -192,6 +198,22 @@ Actual reads are additionally bounded at decompression time
 Embedded XLSX files are ZIP containers too, so their inner entries are
 validated with the same unconditional ZIP-bomb rules before `openpyxl` parses them.
 
+**Output write boundary**: the per-document output subfolder must be a real
+directory (symlinks are rejected before anything is written, and the resolved
+real path must stay inside the output root). The Markdown file and the
+`.converted` sentinel are written through randomly-named exclusively-created
+temp files followed by an atomic replace. For an existing regular file, the
+temporary file is created with permissions no broader than that file's before
+any content is written, and the replacement preserves its permission bits.
+New files honor the caller's umask (no forced group/other-readable mode).
+Image writes inside `assets/` use exclusive creation
+(O_EXCL), never follow pre-placed (including dangling) symlinks, and when a
+candidate name is already occupied by a different file/link/directory the
+allocator keeps trying suffixed candidates until it finds a reusable or free
+name — so nothing can be deleted or overwritten outside the requested output
+directory, and every Markdown reference points at a regular file holding the
+exact image bytes.
+
 XML parsing goes through `defusedxml` when installed (falls back to stdlib
 `xml.etree` otherwise); `defusedxml` is listed as an optional dependency.
 
@@ -199,7 +221,11 @@ XML parsing goes through `defusedxml` when installed (falls back to stdlib
 
 - **Per-document timeout**: `--timeout` (default 300s) via POSIX `signal.alarm`;
   `<=0` disables. Windows (no SIGALRM) and non-main threads degrade to no timeout.
-  The previous signal handler is always restored.
+  The previous signal handler is always restored. A `TimeoutError` raised inside
+  the conversion (e.g. while parsing an embedded Excel, comparing or checking an
+  existing asset candidate, or stating an output path to choose its mode) is
+  re-thrown past every degradation handler, so a timed-out document always
+  counts as failed, gets cleaned up and never receives a sentinel.
 - **`--on-limit reject|skip`** (default `reject`): pass-through of the degradation
   policy above — `skip` lets normal documents with oversized attachments convert
   (attachment dropped with a visible note); zip-bomb inputs still count as failures
@@ -211,7 +237,7 @@ XML parsing goes through `defusedxml` when installed (falls back to stdlib
 ### Additional Enhancements
 
 - **Excel date/number formatting**: `datetime` with zero time → `YYYY-MM-DD`; integer `float` → no `.0`
-- **Footnotes**: mammoth footnote HTML → Markdown `[^N]` / `[^N]: text` syntax
+- **Footnotes**: mammoth footnote HTML → Markdown `[^N]` / `[^N]: text` syntax. The complete footnote is extracted, including nested lists and following paragraphs. Paragraph/list boundaries and all text whitespace are normalized to spaces on a single definition line; list indentation is flattened. Literal tag text such as `<time>` remains visible when rendered. Images inside a footnote stay on that line as `![](...)` — the extracted asset is referenced in place instead of being left as an unreferenced file; an over-limit image becomes the same visible skip note used in the body
 - **Text boxes**: Extracts `<w:txbxContent>` content ignored by mammoth, appended as blockquote
 - **Math formulas**: Extracts OMML text nodes, wraps in `$$ ... $$` (basic detection, not full LaTeX)
 - **Residual text cleanup**: Removes "点击图片可查看完整电子表格" after table replacement

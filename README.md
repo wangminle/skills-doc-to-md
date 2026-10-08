@@ -1,6 +1,6 @@
 # skills-docstomd-withpics
 
-![Version](https://img.shields.io/badge/version-0.1.8-blue)
+![Version](https://img.shields.io/badge/version-0.1.9-blue)
 
 本仓库用于发布一个 Codex Skill：`docx-to-markdown`（`skills/docx-to-markdown/SKILL.md`），用于将 Word 的 `.docx` 文档转换为 Markdown，并提取图片/转换嵌入的 Excel 表格。
 
@@ -15,6 +15,7 @@
 ## 功能
 
 - `.docx → .md`：保留常见标题、段落、列表、链接、表格
+- 嵌套表格与特殊文本保真：嵌套表格以内联转义文本降级呈现；单元格中的管道、反斜线、字面 `<tag>` 文本（如 `<time>` 槽位）经统一最终转义，在 Markdown 与 PDF 渲染中完整可见、不错列
 - 标题还原增强：优先使用 DOCX `heading_*` 样式映射标题层级（style/编号深度直接对应 `#` 层级），保持原始编号不做自动重排，并在满足条件时将文首整行加粗提升为一级标题
 - 图片提取：输出到 `assets/`，Markdown 使用相对路径引用
 - 嵌入 Excel：将嵌入的 `.xlsx` 转为 Markdown 表格
@@ -26,7 +27,7 @@
 - 残留预览文本清理：表格替换后自动移除「点击图片可查看完整电子表格」等残留说明
 - 批处理：批量转换目录下多个 DOCX（扩展名大小写不敏感），支持 `--force` 强制重新转换、`--timeout` 单文档超时（默认 300 秒）与 `--on-limit` 资源超限处置；批内文件名清洗后相同时（如 NFKC 归一化的 `A` 与全角 `Ａ`）自动附加短 hash 消歧，输出互不覆盖；任一文档失败时 CLI 退出码 1，供 CI/自动化判定
 - SHA-256 完成标记：转换成功后写入 `.converted`（记录源哈希），源文件变更后批处理自动重转；失败/半成品输出自动清理
-- 恶意 DOCX 资源耗尽防线：解压前校验 ZIP（总解压 500MB、单 entry 100MB、压缩比 100x、图片数量/大小/像素上限），嵌入 XLSX 在交给 openpyxl 前还会独立校验内层 ZIP；超限抛 `DocxSecurityError`（继承 `ValueError`，但不可降级重试）；实际读取再按真实解压量兜底；可选 defusedxml 加固 XML 解析
+- 恶意 DOCX 资源耗尽防线：解压前校验 ZIP（总解压 500MB、单 entry 100MB、压缩比 100x、图片数量/大小/像素上限；图片按 Mammoth 处理的正文 part——document/脚注/尾注——的实际关系目标识别，覆盖 `word/media/` 之外的任意包内位置），嵌入 XLSX 在交给 openpyxl 前还会独立校验内层 ZIP；超限抛 `DocxSecurityError`（继承 `ValueError`，但不可降级重试）；实际读取再按真实解压量兜底；可选 defusedxml 加固 XML 解析
 - 资源超限可选降级（`on_limit` / `--on-limit`，默认拒绝）：`skip` 模式仅跳过超限资源继续转换——带超大 Excel/图片附件的正常文档也能转出正文，超限图片原位置留可见跳过说明且绝不落盘（mammoth 回调同享防线与配额，无旁路）；zip bomb 等恶意特征任何模式下仍整篇拒绝
 - 自定义输出命名（`output_name` / `--output-name`）：以指定名称（如用户上传的原始文件名）统一命名输出目录、`.md` 文件与 sentinel；末尾 `.docx` 自动去除，`V2.4` 等非 DOCX 点号后缀保留，再经同一套 `sanitize_stem` 清洗
 - `.md → .pdf`（可选）：独立脚本，优先 pandoc；pandoc 失败时自动切换 xelatex + CJK 字体，最终回退 Python 引擎；Python 引擎对含 `<>` `&` 的文本做了 escape 安全处理
@@ -102,16 +103,17 @@ output_dir/
   - 用于保留原始合并范围信息，便于程序/LLM 做语义还原
 - 表格替换后，脚本会自动清除「点击图片可查看完整电子表格」等预览图残留文本。
 - 当同一预览图在文档中重复出现时，脚本会优先持续替换为表格；不会因为队列耗尽退化为普通图片。
-- 脚注：mammoth 输出的脚注 HTML 会自动转为 `[^N]` / `[^N]: text` 语法。
+- 脚注：mammoth 输出的脚注 HTML 会自动转为 `[^N]` / `[^N]: text` 语法；脚注内的图片同样保留为 Markdown 图片引用（skip 模式下保留可见跳过说明）。
 - 文本框：mammoth 忽略的 `<w:txbxContent>` 内容会被提取，以引用块追加至文档末尾。
 - 数学公式：OMML `<m:oMath>` 中的纯文本会被提取并以 `$$ ... $$` 标记输出（完整 OMML→LaTeX 需额外工具）。
 - 批量转换默认只在「输出 + `.converted` 标记 + 源哈希 + `on_limit` 策略一致」时跳过；源文件或策略变化后自动重转，`--force` 用于强制全量重建。V0.1.6 未记录策略的 JSON sentinel 按 `reject` 兼容读取。
-- 批处理对 `.docx`/`.DOCX`/`.Docx` 等扩展名大小写不敏感；批内两个文件名清洗后相同时，后来者输出到 `原名_hash8`（仍冲突则加序号）目录，互不覆盖。ZIP 中显式的 `word/media/` 目录 entry 不会被当作空图片提取。
+- 批处理对 `.docx`/`.DOCX`/`.Docx` 等扩展名大小写不敏感；批内两个文件名清洗后相同时，后来者输出到 `原名_hash8`（仍冲突则加序号）目录，互不覆盖。ZIP 中零字节目录占位不计入图片配额、不提取为空图片；正文误将其引用为图片时显示“图片关系指向空目录”，两种资源策略均适用。带非零内容的目录名条目仍直接拒绝。
 - 批处理任一文档失败（含超时/安全拒绝）时 CLI 退出码为 1；全部成功或跳过为 0。Python API `batch_convert()` 返回 `{"success", "skipped", "failed"}` 统计。
-- 单文档转换默认 300 秒超时（`--timeout`，Windows 自动跳过）；失败与安全拒绝都会清理半成品输出目录。
+- 单文档转换默认 300 秒超时（`--timeout`，Windows 自动跳过）；失败与安全拒绝都会清理半成品输出目录。转换内部（如 Excel 解析、资源比较）触发超时的 `TimeoutError` 不会被任何降级捕获吞掉，超时文档一律计失败、清理输出且不写 sentinel。
+- 输出写入边界：输出子目录为符号链接时直接拒绝（并校验最终真实路径仍在输出根目录内）；Markdown 与 `.converted` sentinel 经随机独占临时文件原子替换，保留已有文件权限、新文件遵守调用者 umask；assets 内图片独占创建写入，不跟随预置符号链接（含悬空链接）。
+- 修正图片扩展名后若发生重名冲突，脚本会循环换名（hash 后缀、序号），仅当已有条目是内容一致的普通文件时才复用——被错误文件、目录或符号链接占用的候选不会盲复用。
 - 恶意/异常 DOCX（zip bomb、超大图片、超高压缩比等）会被 `DocxSecurityError` 拒绝——该异常继承 `ValueError`，但语义上是安全拒绝，调用方不可降级重试。
 - 「超大附件」类超限（图片数量/单图大小/像素、嵌入 Excel 大小）可通过 `on_limit="skip"` / `--on-limit skip` 降级为仅跳过该资源：正文保留、超限图片原位置留可见跳过说明、所有读取仍带上限；zip bomb 等恶意特征不受该开关影响，依旧整篇拒绝。默认 `reject` 与历史行为一致。
-- 修正图片扩展名后若发生重名冲突，脚本会自动追加 hash 后缀，避免覆盖已提取文件。
 - 输入文件若不是有效 DOCX/ZIP（或缺少 `word/document.xml`），会抛出明确错误信息。
 - 如果只需要简单的 DOCX 转 MD（无嵌入 Excel），推荐直接使用 `pandoc --extract-media ./media input.docx -o output.md`。
 

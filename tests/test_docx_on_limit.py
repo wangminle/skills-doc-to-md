@@ -289,7 +289,12 @@ class TestOnLimitPolicy(unittest.TestCase):
             output_dir.mkdir(parents=True)
             external_dir.mkdir()
             (external_dir / "keep.txt").write_text("keep", encoding="utf-8")
-            os.symlink(external_dir, output_dir / "assets")
+            try:
+                os.symlink(external_dir, output_dir / "assets")
+            except (OSError, NotImplementedError) as exc:
+                # Windows 上 os.symlink 存在但默认无创建特权（WinError 1314），
+                # 守卫应做能力探测而非仅检查 hasattr。
+                self.skipTest(f"当前环境无法创建符号链接: {exc}")
             build_docx_with_images(path, [tiny_png(2, 2)])
 
             with self.assertRaisesRegex(ValueError, "assets 目录"):
@@ -449,6 +454,286 @@ class TestOnLimitPolicy(unittest.TestCase):
                     self.convert.convert_docx_to_markdown(
                         path, os.path.join(tmp, "out"), on_limit="skip"
                     )
+
+
+def move_media_to_custom(path):
+    """把 word/media 条目重定位到 word/custom 并同步改写 rels Target。
+
+    构造“图片关系指向非标准包内位置”的 DOCX（BUG-026 复现路径）。
+    """
+    with zipfile.ZipFile(path, "r") as zf:
+        entries = [(info.filename, zf.read(info.filename)) for info in zf.infolist()]
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in entries:
+            if name.startswith("word/media/"):
+                name = "word/custom/" + name[len("word/media/"):]
+            elif name == "word/_rels/document.xml.rels":
+                data = data.replace(b'Target="media/', b'Target="custom/')
+            zf.writestr(name, data)
+
+
+class TestNonStandardMediaLocation(unittest.TestCase):
+    """BUG-026 回归：图片关系指向 word/media 之外的包内路径时，
+    reject 的像素/大小防线与 skip 的数量配额都不得被绕过。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.convert = load_module("convert_docx_module", CONVERT_SCRIPT)
+
+    def test_reject_pixel_bomb_in_custom_media_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bomb.docx")
+            build_docx_with_images(path, [pixel_bomb_png()])
+            move_media_to_custom(path)
+
+            with self.assertRaises(self.convert.DocxSecurityError):
+                self.convert.convert_docx_to_markdown(path, os.path.join(tmp, "out"))
+
+            # 超限图片绝不落盘
+            written = [f for _, _, files in os.walk(os.path.join(tmp, "out")) for f in files]
+            self.assertFalse(any(f.endswith(".png") for f in written), written)
+
+    def test_skip_count_quota_binds_custom_media_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "multi.docx")
+            build_docx_with_images(path, [tiny_png(2, 2), tiny_png(3, 3), tiny_png(4, 4)])
+            move_media_to_custom(path)
+
+            with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 1}):
+                md_path = self.convert.convert_docx_to_markdown(
+                    path, os.path.join(tmp, "out"), on_limit="skip")
+
+            markdown = Path(md_path).read_text(encoding="utf-8")
+            self.assertIn("正文保留测试", markdown)
+            self.assertEqual(markdown.count("![](assets/"), 1)
+            self.assertEqual(markdown.count("【图片已跳过：图片数量超过上限】"), 2)
+            self.assertEqual(os.listdir(Path(md_path).parent / "assets"), ["image1.png"])
+
+    def test_validate_counts_custom_media_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "multi.docx")
+            build_docx_with_images(path, [tiny_png(2, 2), tiny_png(3, 3), tiny_png(4, 4)])
+            move_media_to_custom(path)
+
+            with zipfile.ZipFile(path, "r") as zf:
+                with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 2}):
+                    with self.assertRaises(self.convert.ResourceLimitExceeded):
+                        self.convert.validate_docx_zip_security(zf)
+
+
+def _drawing_xml(rid, did):
+    return (
+        f'<w:drawing><wp:inline><wp:extent cx="100" cy="100"/><a:graphic><a:graphicData '
+        f'uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic><pic:nvPicPr>'
+        f'<pic:cNvPr id="{did}" name="img{did}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill>'
+        f'<a:blip r:embed="{rid}"/></pic:blipFill><pic:spPr/></pic:pic></a:graphicData></a:graphic>'
+        f'</wp:inline></w:drawing>'
+    )
+
+
+def build_docx_images_in_part(path, footnote=False, absolute=False,
+                              footnote_bodies=None, extra_entries=None):
+    """构造图片位于非标准位置的最小 DOCX（BUG-026 验收补充场景）。
+
+    footnote=True：图片放在 word/footnotes.xml（关系在 footnotes.xml.rels），
+      主文档仅保留 w:footnoteReference 引用——mammoth 同样触发图片回调；
+    absolute=True：图片条目与关系 Target 均以包根为基准（custom/imageN.png
+      与 Target="/custom/imageN.png"）。
+    其余场景与 build_docx_with_images 一致（word/custom/ 相对目标）。
+    """
+    ns = _DOC_NS
+    if footnote:
+        bodies = footnote_bodies or {}
+        notes = "".join(
+            f'<w:footnote w:id="{i}">'
+            + bodies.get(i, f'<w:p><w:r>{_drawing_xml(f"rId{i}", i)}</w:r></w:p>')
+            + '</w:footnote>'
+            for i in (1, 2, 3)
+        )
+        refs = "".join(
+            f'<w:p><w:r><w:footnoteReference w:id="{i}"/></w:r></w:p>' for i in (1, 2, 3)
+        )
+        document = (
+            f'<?xml version="1.0"?><w:document {ns}><w:body>{refs}'
+            f'<w:p><w:r><w:t>正文保留测试</w:t></w:r></w:p></w:body></w:document>'
+        )
+        footnotes = f'<?xml version="1.0"?><w:footnotes {ns}>{notes}</w:footnotes>'
+        rels_name, part_entries = "word/_rels/footnotes.xml.rels", [("word/footnotes.xml", footnotes)]
+        main_entries = [("word/document.xml", document)]
+    else:
+        paras = "".join(
+            f'<w:p><w:r>{_drawing_xml(f"rId{i}", i)}</w:r></w:p>' for i in (1, 2, 3)
+        )
+        document = (
+            f'<?xml version="1.0"?><w:document {ns}><w:body>{paras}'
+            f'<w:p><w:r><w:t>正文保留测试</w:t></w:r></w:p></w:body></w:document>'
+        )
+        rels_name, part_entries = "word/_rels/document.xml.rels", []
+        main_entries = [("word/document.xml", document)]
+
+    prefix = "" if absolute else "word/"
+    target_fmt = "/custom/image{i}.png" if absolute else "custom/image{i}.png"
+    rels = (
+        '<?xml version="1.0"?><Relationships '
+        'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(
+            f'<Relationship Id="rId{i}" '
+            f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+            f'Target="{target_fmt.format(i=i)}"/>'
+            for i in (1, 2, 3)
+        )
+        + "</Relationships>"
+    )
+    content_types = (
+        '<?xml version="1.0"?><Types '
+        'xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" ContentType='
+        '"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        + (
+            '<Override PartName="/word/footnotes.xml" ContentType='
+            '"application/vnd.openxmlformats-officedocument.wordprocessingml.document.footnotes+xml"/>'
+            if footnote else ""
+        )
+        + "</Types>"
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        for name, data in main_entries + part_entries:
+            zf.writestr(name, data)
+        zf.writestr(rels_name, rels)
+        for i, (w, h) in enumerate([(2, 2), (3, 3), (4, 4)], 1):
+            zf.writestr(f"{prefix}custom/image{i}.png", tiny_png(w, h))
+        for name, data in (extra_entries or {}).items():
+            zf.writestr(name, data)
+
+
+class TestNonStandardMediaLocationAdvanced(unittest.TestCase):
+    """BUG-026 验收补充：脚注关系与包根绝对目标同样受数量配额约束。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.convert = load_module("convert_docx_module", CONVERT_SCRIPT)
+
+    def _assert_quota_binds(self, footnote, absolute):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.docx")
+            build_docx_images_in_part(path, footnote=footnote, absolute=absolute)
+
+            with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 1}):
+                with self.assertRaises(self.convert.DocxSecurityError):
+                    self.convert.convert_docx_to_markdown(
+                        path, os.path.join(tmp, "out-reject"))
+
+                md_path = self.convert.convert_docx_to_markdown(
+                    path, os.path.join(tmp, "out-skip"), on_limit="skip")
+
+            assets = os.listdir(Path(md_path).parent / "assets")
+            self.assertEqual(len(assets), 1, assets)
+            self.assertIn(assets[0], ("image1.png",))
+
+    def test_footnote_relationship_images_count_toward_quota(self):
+        self._assert_quota_binds(footnote=True, absolute=False)
+
+    def test_package_root_absolute_targets_count_toward_quota(self):
+        self._assert_quota_binds(footnote=False, absolute=True)
+
+    def test_footnote_image_stays_referenced_in_markdown(self):
+        """配额内的脚注图片必须出现在 [^N]: 定义中，不能只落盘成孤儿文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.docx")
+            build_docx_images_in_part(path, footnote=True)
+            md_path = self.convert.convert_docx_to_markdown(path, os.path.join(tmp, "out"))
+            text = Path(md_path).read_text(encoding="utf-8")
+            for i in (1, 2, 3):
+                self.assertRegex(text, rf"\[\^{i}\]: !\[\]\(assets/image{i}\.png\)")
+            assets = list((Path(md_path).parent / "assets").iterdir())
+            self.assertEqual(len(assets), 3)
+
+    def test_skipped_footnote_image_leaves_visible_note(self):
+        """skip 超限的脚注图片要在脚注定义里留下可见说明（BUG-029 / DEV-006）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.docx")
+            build_docx_images_in_part(path, footnote=True)
+            with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 1}):
+                md_path = self.convert.convert_docx_to_markdown(
+                    path, os.path.join(tmp, "out"), on_limit="skip")
+            text = Path(md_path).read_text(encoding="utf-8")
+            self.assertRegex(text, r"\[\^1\]: !\[\]\(assets/image1\.png\)")
+            self.assertEqual(text.count("【图片已跳过：图片数量超过上限】"), 2)
+            self.assertIn("正文保留测试", text)
+            assets = os.listdir(Path(md_path).parent / "assets")
+            self.assertEqual(assets, ["image1.png"])
+
+    def test_docx_footnote_literal_tags_remain_visible(self):
+        """真实 DOCX 脚注中的槽位与 table 字面文本不得丢失。"""
+        import markdown as markdown_lib
+
+        body = '<w:p><w:r><w:t>字面 &lt;time&gt; &lt;table&gt; END</w:t></w:r></w:p>'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "literal.docx")
+            build_docx_images_in_part(path, footnote=True, footnote_bodies={1: body})
+            md_path = self.convert.convert_docx_to_markdown(path, os.path.join(tmp, "out"))
+            text = Path(md_path).read_text(encoding="utf-8")
+            self.assertIn("[^1]: 字面 &lt;time&gt; &lt;table&gt; END", text)
+            rendered = markdown_lib.markdown(text, extensions=["footnotes"])
+            self.assertIn("字面 &lt;time&gt; &lt;table&gt; END", rendered)
+
+    def test_docx_footnote_newlines_keep_images_and_skip_notes_in_definition(self):
+        """保留空白的 Word 文本不得把后置图片或 skip 说明挤到正文。"""
+        body = (
+            '<w:p><w:r><w:t xml:space="preserve">Alpha\n\nBeta</w:t></w:r>'
+            f'<w:r>{_drawing_xml("rId1", 1)}</w:r>'
+            '<w:r><w:t xml:space="preserve">Gamma\n\nDelta</w:t></w:r>'
+            f'<w:r>{_drawing_xml("rId2", 2)}</w:r></w:p>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "blank.docx")
+            build_docx_images_in_part(path, footnote=True, footnote_bodies={1: body})
+            with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 1}):
+                md_path = self.convert.convert_docx_to_markdown(
+                    path, os.path.join(tmp, "out"), on_limit="skip")
+            text = Path(md_path).read_text(encoding="utf-8")
+            definition = next(line for line in text.splitlines() if line.startswith("[^1]:"))
+            self.assertIn("Alpha Beta![](assets/image1.png)Gamma Delta", definition)
+            self.assertIn("【图片已跳过：图片数量超过上限】", definition)
+            self.assertEqual(os.listdir(Path(md_path).parent / "assets"), ["image1.png"])
+
+    def test_docx_footnote_list_keeps_images_skip_notes_and_tail(self):
+        """Word 编号列表在 mammoth 生成内层 li 后，脚注仍须完整。"""
+        list_props = '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="42"/></w:numPr></w:pPr>'
+        body = (
+            f'<w:p>{list_props}<w:r><w:t>第一项</w:t></w:r></w:p>'
+            f'<w:p>{list_props}<w:r><w:t>第二项</w:t></w:r>'
+            f'<w:r>{_drawing_xml("rId1", 1)}</w:r>'
+            f'<w:r>{_drawing_xml("rId2", 2)}</w:r></w:p>'
+            '<w:p><w:r><w:t>末尾</w:t></w:r></w:p>'
+        )
+        numbering = (
+            '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:abstractNum w:abstractNumId="42"><w:lvl w:ilvl="0">'
+            '<w:start w:val="1"/><w:numFmt w:val="bullet"/>'
+            '<w:lvlText w:val="•"/></w:lvl></w:abstractNum>'
+            '<w:num w:numId="42"><w:abstractNumId w:val="42"/></w:num></w:numbering>'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "list.docx")
+            build_docx_images_in_part(
+                path, footnote=True, footnote_bodies={1: body},
+                extra_entries={"word/numbering.xml": numbering})
+            with mock.patch.dict(self.convert.DOCX_SECURITY_LIMITS, {"image_count": 1}):
+                md_path = self.convert.convert_docx_to_markdown(
+                    path, os.path.join(tmp, "out"), on_limit="skip")
+            text = Path(md_path).read_text(encoding="utf-8")
+            definition = next(line for line in text.splitlines() if line.startswith("[^1]:"))
+            for fragment in ("第一项 第二项", "![](assets/image1.png)",
+                             "【图片已跳过：图片数量超过上限】", "末尾"):
+                self.assertIn(fragment, definition)
+            main = text.split("\n\n---\n\n", 1)[0]
+            self.assertNotIn("第二项", main)
+            self.assertNotIn("末尾", main)
 
 
 class TestOnLimitCLI(unittest.TestCase):

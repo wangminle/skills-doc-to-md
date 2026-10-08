@@ -101,7 +101,7 @@ output/
 
 | 防线 | 默认阈值 |
 |------|---------|
-| 图片数量（`word/media/`） | 500 |
+| 图片数量（物理图片条目：`word/media/` 条目 ∪ Mammoth 处理的全部正文 part——document/footnotes/endnotes——关系文件中的 image 目标，含 `word/custom/` 与包根等非标准位置；目标同时按 Mammoth 的字面拼接口径与规范化口径计入，含 `.`/`..` 路径段的字面条目如 `word/custom/../image1.png` 无法绕过计数） | 500 |
 | 单图文件大小 | 20 MB |
 | 单图像素（解压炸弹检测） | 5000 万 |
 | 嵌入 Excel 大小 | 50 MB |
@@ -224,11 +224,14 @@ Excel）传 `error_cls=ResourceLimitExceeded` 供 `skip` 模式精确捕获。
 - 编号标题默认保持原始编号，不进行自动重排
 - 文首整行加粗仅在后续存在“编号章节标题”时提升为一级标题
 - `<img src=...>` 和 `<a href=...>` 支持双引号、单引号、无引号三种写法
-- HTML 实体通过 `html.unescape()` 统一解码，覆盖所有命名和数字实体
+- 嵌套表格（单元格内再含 `<table>`）降级为单元格内的内联转义文本，内容保留而非丢失
+- HTML 实体通过 `html.unescape()` 统一解码；实体形式的标签样文本（如 `&lt;time&gt;`）受保护并还原为实体，渲染为可见的字面文本，不会被当作原始 HTML 吞掉
 
 #### `_convert_footnotes(html)`
 
 将 mammoth 生成的脚注 HTML 转换为 Markdown 脚注语法 `[^N]` / `[^N]: text`。
+脚注体内的 `<img>` 会转换为同一行的 Markdown 图片语法（assets 引用与
+`on_limit="skip"` 的可见跳过说明均保留在脚注定义中）。
 
 **mammoth 输出格式：**
 - 正文引用: `<sup><a href="#footnote-N">[N]</a></sup>`
@@ -438,7 +441,7 @@ Python 引擎在将文本传入 reportlab `Paragraph` 前统一调用 `xml.sax.s
 
 ### Q: 图片没有正确提取？
 
-检查 DOCX 文件结构，确保图片在 `word/media/` 目录下。某些第三方工具生成的 DOCX 可能有不同结构。
+`word/media/` 下的图片以及正文/脚注/尾注关系中指向的任意包内位置（如 `word/custom/`、包根 `custom/`）都会提取。仍提取不到时，检查 DOCX 内部结构是否异常（某些第三方工具生成的 DOCX 结构可能不标准）。
 
 ### Q: Excel 表格没有转换？
 
@@ -453,7 +456,9 @@ Python 引擎在将文本传入 reportlab `Paragraph` 前统一调用 `xml.sax.s
 
 ### Q: 图片提取时会不会因为扩展名修正而覆盖同名文件？
 
-默认不会。若修正扩展名后发生重名且内容不同，脚本会自动追加短 hash 后缀（如 `_a1b2c3d4`）避免覆盖。
+默认不会。若修正扩展名后发生重名，脚本会循环尝试候选名（短 hash 后缀、序号后缀），
+仅当已有条目是内容一致的普通文件时才复用；被错误文件、目录或符号链接占用的候选
+不会盲复用，输出引用的一定是内容正确的普通文件。
 
 ### Q: PDF 中文显示为方块？
 
@@ -513,6 +518,8 @@ python scripts/convert_docx.py upload1234.docx ./output --output-name 用户原�
 
 用 `--timeout`（默认 300 秒）限制单文档转换时长，超时计为失败并清理该文档的
 半成品输出。该机制基于 POSIX `signal.alarm`，Windows 上自动跳过（无超时保护）。
+转换内部（如 Excel 解析、资源比较、资源候选路径检查）触发的 `TimeoutError`
+不会被任何降级捕获吞掉，超时文档一律计失败、清理输出且不写 `.converted`。
 
 ### Q: 需要额外安装 defusedxml 吗？
 

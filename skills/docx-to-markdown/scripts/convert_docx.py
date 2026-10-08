@@ -9,12 +9,13 @@ import json
 import logging
 import math
 import os
+import stat
 import sys
 import zipfile
 import re
 import io
 import unicodedata
-from html import unescape
+from html import escape as _escape_html, unescape
 from html.parser import HTMLParser
 from collections import defaultdict
 import posixpath
@@ -62,7 +63,7 @@ DOCX_SECURITY_LIMITS = {
     "entry_ratio": 100,                         # 单 entry 压缩比上限
     "total_ratio": 100,                         # 总压缩比上限
     "total_ratio_min_compressed": 1024 * 1024,  # 总压缩比仅对压缩后 >1MB 的包判定
-    "image_count": 500,                         # word/media 图片数量上限
+    "image_count": 500,                         # 物理图片条目数量上限（word/media 及关系目标）
     "image_file_size": 20 * 1024 * 1024,        # 单图文件大小上限
     "image_pixels": 50_000_000,                 # 单图像素上限（解压炸弹检测）
     "embedded_excel_size": 50 * 1024 * 1024,    # 嵌入 Excel 大小上限
@@ -71,13 +72,14 @@ DOCX_SECURITY_LIMITS = {
 # 批处理跳过判定用的完成标记文件名（JSON，记录源文件 SHA-256）
 SENTINEL_FILENAME = ".converted"
 
-# on_limit="skip" 时超限资源在 Markdown 中的可见说明文案。
+# on_limit="skip" 时超限资源，以及两种策略下空目录伪图片的可见说明文案。
 # mammoth 回调用 __SKIPPED_IMAGE_<reason>__ 作为 src 占位，转换后统一
 # 替换为对应说明，保证跳过在输出中可见且不引用不存在的资源文件。
 SKIPPED_IMAGE_NOTE = {
     "size": "单图超过大小上限",
     "pixels": "单图像素超过上限",
     "count": "图片数量超过上限",
+    "directory": "图片关系指向空目录",
 }
 
 
@@ -93,6 +95,139 @@ def _fmt_bytes(size: int) -> str:
     if size >= 1024 * 1024:
         return f"{size / (1024 * 1024):.1f}MB"
     return f"{size / 1024:.1f}KB"
+
+
+# relationship 文件的真实读取上限：正常 rels 仅数 KB，超过即视为恶意构造。
+_RELS_MAX_BYTES = 16 * 1024 * 1024
+
+# Mammoth 会转换为 HTML 的正文相关 part 及其关系文件按包关系动态解析
+# （见 _mammoth_content_parts）：正文 part 可经 _rels/.rels 重定向到诱饵
+# document.xml 之外的任意条目，图片关系也可以出现在脚注/尾注/批注的
+# rels 中（mammoth 同样触发图片回调）；只统计硬编码主文档关系会被改写
+# Target 的文档绕过数量配额（见 BUG-026/BUG-042）。
+
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _rels_path_for(part_name: str) -> str:
+    """part 的关系文件名，与 mammoth 同口径：同目录 _rels/<basename>.rels。"""
+    dirname, _, basename = part_name.rpartition("/")
+    return f"{dirname}/_rels/{basename}.rels" if dirname else f"_rels/{basename}.rels"
+
+
+def _mammoth_join_path(base: str, target: str) -> str:
+    """两段路径拼接，与 mammoth zips.join_path 同口径：以 / 开头的 target 重置。"""
+    if target.startswith("/"):
+        return target
+    return f"{base}/{target}" if base else target
+
+
+def _rels_internal_targets(
+    zip_ref: zipfile.ZipFile, rels_name: str, type_suffix: str
+) -> List[str]:
+    """读取关系文件，返回 Type 以 /<type_suffix> 结尾的内部关系 Target 原文。
+
+    关系文件缺失/损坏/不可读时返回空列表（对应 mammoth 的
+    _try_read_entry_or_default 回退语义）；External 关系排除；
+    TimeoutError 显式重抛，不得被降级吞掉。
+    """
+    try:
+        rels_content = read_zip_entry_bounded(zip_ref, rels_name, _RELS_MAX_BYTES)
+        rels_root = _safe_xml_fromstring(rels_content)
+    except TimeoutError:
+        raise
+    except (KeyError, OSError, zipfile.BadZipFile, ValueError, SyntaxError):
+        return []
+    targets = []
+    for rel in rels_root.findall(f".//{{{_REL_NS}}}Relationship"):
+        if (rel.get("Type") or "").endswith(f"/{type_suffix}") and \
+                (rel.get("TargetMode") or "Internal") != "External":
+            target = rel.get("Target") or ""
+            if target:
+                targets.append(target)
+    return targets
+
+
+def _mammoth_content_parts(zip_ref: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    """按 mammoth 同口径动态解析会被读取的正文相关 part 及其关系文件。
+
+    mammoth（docx/_find_part_paths）从 _rels/.rels 的 officeDocument 关系
+    定位正文 part（不硬编码 word/document.xml），footnotes/endnotes/
+    comments 又按正文 part 的关系文件定位；每个被读取 part 的关系文件
+    都可能承载图片关系。只扫硬编码清单会被重定向 Target 的文档绕过
+    图片数量配额（见 BUG-042）。
+
+    解析口径与 mammoth 一致：关系目标按 join_path(base, target) 解析、
+    lstrip("/") 后逐个检查存在性、取第一个命中的；无命中时回退默认
+    路径（正文为 word/document.xml，notes 为 word/<名>.xml）。
+    """
+    entry_names = {info.filename for info in zip_ref.infolist()}
+    main = None
+    for target in _rels_internal_targets(zip_ref, "_rels/.rels", "officeDocument"):
+        candidate = _mammoth_join_path("", target).lstrip("/")
+        if candidate in entry_names:
+            main = candidate
+            break
+    if main is None:
+        main = "word/document.xml"
+
+    parts = [(main, _rels_path_for(main))]
+    base_dir = posixpath.dirname(main)
+    for name in ("footnotes", "endnotes", "comments"):
+        part = None
+        for target in _rels_internal_targets(zip_ref, _rels_path_for(main), name):
+            candidate = _mammoth_join_path(base_dir, target).lstrip("/")
+            if candidate in entry_names:
+                part = candidate
+                break
+        if part is None:
+            part = f"word/{name}.xml"
+        parts.append((part, _rels_path_for(part)))
+    return parts
+
+
+def _document_image_part_names(zip_ref: zipfile.ZipFile) -> set:
+    """收集包内全部“物理图片资源”条目名。
+
+    覆盖两类位置，缺一不可（见 BUG-026/BUG-042）：
+      1. word/media/ 下的条目（无论是否被引用）——历史统计语义；
+      2. Mammoth 实际读取的各正文 part（动态解析，见 _mammoth_content_parts）
+         关系文件中 Type 以 /image 结尾的关系目标。DOCX 图片关系可指向包内
+         任意位置（word/custom/、包根 custom/ 等），仅按 word/media/ 前缀
+         统计会被改写 Target 的文档绕过资源防线。
+    关系目标同时按两种口径解析（见 BUG-038）：Mammoth 读图用
+    uri_to_zip_entry_name 的字面拼接（/ 开头取 uri[1:]，否则
+    "word/" + uri，不做 normpath），含 . / .. 段的字面条目
+    （word/custom/../imageN.png）只有字面口径能命中；规范化口径
+    覆盖按规范名存储的正常文档。两种名字只要真实存在于 ZIP 即计入。
+    非零内容的目录名条目（名字以 / 结尾）仍计入扫描：字面 Target
+    指向的条目能被 zipfile 按字面名读取（见 BUG-043），安全校验随后
+    无条件拒绝此类条目。零字节目录占位在前缀及关系两种口径均排除
+    （见 BUG-049），不占图片配额。
+    仅返回 ZIP 中真实存在的条目；External 链接自动排除。
+    """
+    entry_names = set()
+    image_parts = set()
+    for info in zip_ref.infolist():
+        # 仅排除零字节目录占位；带内容的目录名条目仍扫描并由 ZIP
+        # 安全校验拒绝，不能恢复 BUG-043 的 is_dir() 无条件排除。
+        if info.is_dir() and info.file_size == 0:
+            continue
+        entry_names.add(info.filename)
+        if info.filename.startswith("word/media/") and \
+                len(info.filename) > len("word/media/"):
+            image_parts.add(info.filename)
+
+    for source_part, rels_name in _mammoth_content_parts(zip_ref):
+        for target in _rels_internal_targets(zip_ref, rels_name, "image"):
+            # 字面口径与 Mammoth 一致：正文 part 均在 word/ 下，
+            # base 固定为 "word"，且不做 strip/反斜杠替换/normpath。
+            literal = target[1:] if target.startswith("/") else f"word/{target}"
+            for name in (literal, resolve_part_path(target, source_part)):
+                # entry_names 已排除零字节目录，关系目标不能将其重新加入。
+                if name in entry_names:
+                    image_parts.add(name)
+    return image_parts
 
 
 def validate_docx_zip_security(zip_ref: zipfile.ZipFile, on_limit: str = "reject") -> None:
@@ -116,12 +251,23 @@ def validate_docx_zip_security(zip_ref: zipfile.ZipFile, on_limit: str = "reject
     total_uncompressed = 0
     image_count = 0
     seen_names = set()
+    # 图片资源按“实际关系目标”识别：word/media 前缀之外的图片同样计数
+    image_part_names = _document_image_part_names(zip_ref)
 
     for info in zip_ref.infolist():
         if info.filename in seen_names:
             raise DocxSecurityError(f"ZIP 包含重复条目名，解压语义不唯一: {info.filename}")
         seen_names.add(info.filename)
         if info.is_dir():
+            # 名字以 / 结尾的“目录”条目仍能被 zipfile 按字面名读取：
+            # 声明非零内容的（正常目录条目 file_size 恒为 0）直接拒绝，
+            # 不得因 is_dir 在体积/压缩比/总量三道检查之前跳过（见 BUG-041）。
+            if info.file_size > 0:
+                raise DocxSecurityError(
+                    f"ZIP 目录名条目声明非零内容（按字面名可读取）: "
+                    f"{info.filename}（{_fmt_bytes(info.file_size)}）"
+                )
+            total_compressed += info.compress_size
             continue
         name = info.filename
         compressed = info.compress_size
@@ -139,7 +285,7 @@ def validate_docx_zip_security(zip_ref: zipfile.ZipFile, on_limit: str = "reject
                 f"ZIP 条目压缩比超过 {limits['entry_ratio']}x: {name}"
             )
 
-        if name.startswith("word/media/"):
+        if name in image_part_names:
             image_count += 1
             if not skip_mode and uncompressed > limits["image_file_size"]:
                 raise ResourceLimitExceeded(
@@ -331,7 +477,7 @@ def image_pixel_count(image_data: bytes) -> Optional[int]:
 
 
 def _read_media_image(zip_ref: zipfile.ZipFile, name: str) -> bytes:
-    """读取 word/media 图片并执行大小/像素防线（真实解压路径的兜底）。
+    """读取包内媒体图片并执行大小/像素防线（真实解压路径的兜底）。
 
     大小与像素均属可降级资源限制，抛 ResourceLimitExceeded：reject 模式
     下与 DocxSecurityError 处置一致（整篇拒绝），skip 模式下由调用方
@@ -358,17 +504,204 @@ def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _path_status(path: str) -> Optional[os.stat_result]:
+    """lstat 查询路径状态；TimeoutError 显式重抛，其余 OSError 按不存在处理。
+
+    os.path.lexists/islink/isfile 内部会捕获 OSError（含其子类
+    TimeoutError），路径检查会吞掉批处理超时信号（见 BUG-035）——必须
+    直接 lstat 并在降级前显式重抛。
+    """
+    try:
+        return os.lstat(path)
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+
+
+def _open_exclusive_temp(directory: str, mode: int = 0o666) -> Tuple[int, str]:
+    """在 directory 内独占创建随机短名临时文件，返回 (fd, 路径)。
+
+    临时名固定为 ``.`` + 12 位十六进制随机字符 + ``.tmp``，长度与目标
+    文件名无关：目标名接近文件系统单名上限（ext4 按 255 字节计，80 个
+    汉字的文档名即达到）时，按目标名拼前缀会让临时名越限触发
+    ENAMETOOLONG（见 BUG-036）。以 mode 请求创建权限、由内核按当前
+    umask 归一；新目标默认 0o666，覆盖普通文件时传入原权限，确保临时
+    文件从创建起就不扩大访问权限（见 BUG-037）。无需查询进程 umask：查询需要
+    ``os.umask(0)``/恢复两步，超时信号落在两步之间会让进程 umask 永久
+    变成 0（见 BUG-034）。
+    """
+    for _ in range(100):
+        path = os.path.join(directory, f".{os.urandom(6).hex()}.tmp")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            continue
+        return fd, path
+    raise OSError(f"无法在目录内创建可用的临时文件: {directory}")
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """独占创建同目录随机临时文件写入后原子替换到 path。
+
+    临时文件随机且独占创建，os.replace 只替换 path 的目录项本身：目标
+    位置即使预置了指向外部的符号链接也不会被跟随，写入不会越出输出
+    目录（见 BUG-023）。新文件的权限由独占创建时的 umask 自然决定；
+    目标已是普通文件时，先按原权限创建临时文件，写入期间不扩大权限，
+    替换前再对齐原权限位（见 BUG-028/037）；全程不查询/修改进程级
+    umask（见 BUG-034）。
+    """
+    st = _path_status(path)
+    target_mode = stat.S_IMODE(st.st_mode) if st is not None and stat.S_ISREG(st.st_mode) else None
+    fd, tmp_path = _open_exclusive_temp(
+        os.path.dirname(path) or ".", mode=target_mode if target_mode is not None else 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if target_mode is not None:
+            os.chmod(tmp_path, target_mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _same_file_content(path: str, data: bytes) -> bool:
+    """按“先比大小再读内容”判断 path 是否与 data 一致；读失败按不一致处理。
+
+    TimeoutError 是 OSError 子类且承载批处理超时信号，必须显式重抛，
+    不得按“内容不一致”降级吞掉（见 BUG-025 验收补充）。
+    """
+    try:
+        if os.path.getsize(path) != len(data):
+            return False
+        with open(path, "rb") as f:
+            return f.read() == data
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+
+
+def _safe_realpath(path: str) -> str:
+    """os.path.realpath 的超时安全替代：路径组件上的 TimeoutError 继续上抛。
+
+    realpath 非 strict 模式内部 except OSError 会把组件 lstat 抛出的
+    TimeoutError（批处理 SIGALRM 的单文档超时信号）当“组件不存在”吞掉
+    并返回字面路径，使 alarm 静默丢失（见 BUG-039）。这里按 realpath
+    （非 strict、跟随符号链接、不展开 ~）的语义逐段解析：lstat 走
+    _path_status 的超时安全封装，readlink 显式重抛 TimeoutError；组件
+    不存在时按普通组件继续解析，后续 .. 仍回退并解析后续符号链接；
+    readlink 失败按普通组件处理。用待解析栈及链接缓存识别成环链接，
+    成环处保留字面组件并继续解析余下路径；长链不使用 Python 递归，
+    不会因固定层数上限提前返回。Windows 无 SIGALRM、无吞超时问题，
+    直接用 os.path.realpath。
+    """
+    if os.name == "nt":
+        return os.path.realpath(path)
+    abs_path = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    # None 标记表示某个链接的目标已经完整解析，下一项是缓存键。
+    parts = abs_path.split("/")[::-1]
+    seen = {}
+    resolved = "/"
+    while parts:
+        part = parts.pop()
+        if part is None:
+            seen[parts.pop()] = resolved
+            continue
+        if not part or part == ".":
+            continue
+        if part == "..":
+            resolved = posixpath.dirname(resolved) or "/"
+            continue
+        current = posixpath.join(resolved, part)
+        st = _path_status(current)
+        if st is None or not stat.S_ISLNK(st.st_mode):
+            # 非 strict 语义：缺失组件仍保留，但后续 .. / 链接继续解析。
+            resolved = current
+            continue
+        if current in seen:
+            # None 是仍在解析的链接，说明成环；完整解析的链接则复用缓存。
+            resolved = seen[current] or current
+            continue
+        try:
+            target = os.readlink(current)
+        except TimeoutError:
+            raise
+        except OSError:
+            resolved = current  # 链接不可读：按普通组件继续
+            continue
+        seen[current] = None
+        parts.extend((current, None))
+        parts.extend(target.split("/")[::-1])
+        if target.startswith("/"):
+            resolved = "/"
+    return resolved
+
+
+def _allocate_asset_path(
+    assets_dir: str, base_name: str, actual_ext: str,
+    digest: str, image_data: bytes,
+) -> Tuple[str, str]:
+    """为图片分配输出文件名与路径：自然名 → 短 hash 名 → hash_序号名。
+
+    只有“普通文件且字节一致”才复用既有条目；符号链接（含悬空）、目录
+    或内容不同的占用一律换下一候选（见 BUG-027：hash 候选被占用时不得
+    盲复用）。返回 (文件名, 路径)；路径可能已存在（复用）或不存在（待写）。
+    """
+    candidates = [f"{base_name}{actual_ext}", f"{base_name}_{digest[:8]}{actual_ext}"]
+    candidates += [
+        f"{base_name}_{digest[:8]}_{seq}{actual_ext}" for seq in range(2, 100)
+    ]
+    for name in candidates:
+        path = os.path.join(assets_dir, name)
+        st = _path_status(path)
+        if st is None:
+            return name, path
+        # lstat 判定的普通文件才可能是复用对象：符号链接（含悬空）、
+        # 目录或内容不同的占用一律换下一候选（见 BUG-027）。
+        if stat.S_ISREG(st.st_mode) and _same_file_content(path, image_data):
+            return name, path
+    raise OSError(f"无法为图片分配可用的输出文件名: {base_name}{actual_ext}")
+
+
+def _write_asset_file_exclusive(path: str, data: bytes) -> bool:
+    """以独占创建写入图片文件；返回是否实际写入。
+
+    O_CREAT|O_EXCL 保证检查与写入之间不会被同名符号链接/文件置换
+    （见 BUG-027）。条目已存在时不再静默跳过（见 BUG-047）：普通文件
+    且字节一致视为安全复用（返回 False，无需写入）；符号链接/目录/
+    内容不同的占用抛 FileExistsError，由调用方换下一候选重试，保证
+    Markdown 引用的文件始终是内容正确的普通文件。
+    """
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        st = _path_status(path)
+        if st is not None and stat.S_ISREG(st.st_mode) and _same_file_content(path, data):
+            return False
+        raise
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return True
+
+
 def write_conversion_sentinel(
     final_output_dir: str, folder_name: str, source_sha256: str,
     on_limit: str = "reject",
 ) -> None:
-    """原子写入转换完成标记（tmp + rename），记录输出目录名与源文件哈希。
+    """原子写入转换完成标记（随机独占临时文件 + rename），记录输出目录名与源文件哈希。
 
     批处理据此判断“输出完整且与当前源一致”；仅转换全部成功后调用。
     标记写失败不影响本次转换结果，仅意味着批处理下次会重转。
+    临时文件必须用随机名独占创建：固定名（.converted.tmp）可被预置为
+    指向外部的符号链接，open 会跟随其覆盖外部文件（见 BUG-024）。
+    写入与权限策略复用 _atomic_write_text（见 BUG-028/034/036）。
     """
     sentinel_path = os.path.join(final_output_dir, SENTINEL_FILENAME)
-    tmp_path = sentinel_path + ".tmp"
     validate_on_limit(on_limit)
     payload = json.dumps(
         {"folder_name": folder_name, "source_sha256": source_sha256, "on_limit": on_limit},
@@ -376,14 +709,10 @@ def write_conversion_sentinel(
         sort_keys=True,
     )
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-        os.replace(tmp_path, sentinel_path)
+        _atomic_write_text(sentinel_path, payload)
+    except TimeoutError:
+        raise
     except OSError:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
         logger.warning("写入完成标记失败: %s", sentinel_path, exc_info=True)
 
 
@@ -429,12 +758,17 @@ def prune_stale_assets(assets_dir: str, current_image_sources) -> None:
                 os.remove(entry.path)
 
 
-def _mammoth_embedded_media_key(image) -> Optional[str]:
+def _mammoth_embedded_media_key(image, known_parts: set) -> Optional[str]:
     """尽力从 Mammoth 图片打开函数中取出嵌入媒体路径。
 
-    Mammoth 的公开 Image 对象不暴露 relationship/path，但当前稳定
-    实现会在 open 闭包中捕获 `word/media/...` 路径。只将明确识别
-    的 DOCX 内嵌媒体用于物理条目去重；链接图片不归入 ZIP 配额。
+    Mammoth 的公开 Image 对象不暴露 relationship/path，但当前稳定实现
+    （docx/body_xml.py 的 open_image 闭包）会捕获按 relationship 目标
+    解析出的 zip 条目名（如 word/custom/image1.png）。闭包值就是 Mammoth
+    实际读取的字面条目名，可含 . / .. 段（见 BUG-038），而配额白名单
+    allowed_media_paths 也按字面条目名存放——先按字面匹配，未命中再退
+    回归一化/关系解析两种口径。只接受能在 known_parts（包内物理图片
+    条目集合）中命中的字符串，避免把闭包里的 content_type 等无关字符串
+    误判为媒体路径；链接图片不归入 ZIP 配额。
     """
     opener = getattr(image, "open", None)
     closure = getattr(opener, "__closure__", None) or ()
@@ -444,24 +778,96 @@ def _mammoth_embedded_media_key(image) -> Optional[str]:
         except ValueError:
             continue
         if isinstance(value, str):
-            normalized = posixpath.normpath(value.replace("\\", "/"))
-            if normalized.startswith("word/media/"):
+            if value in known_parts:
+                return value
+            normalized = posixpath.normpath(value.replace("\\", "/").lstrip("/"))
+            if normalized in known_parts:
                 return normalized
+            resolved = resolve_part_path(value)
+            if resolved in known_parts:
+                return resolved
     return None
 
 
+def _escape_plain_cell_text(text: str) -> str:
+    """原始纯文本单元格片段的最终序列化转义。
+
+    反斜线与管道必须整体转义且顺序固定（先反斜线后管道）：只检查管道
+    前一个字符会把原文里的连续反斜线误判为已有转义，Python Markdown
+    渲染时管道仍会拆列（如原文 A\\\\|B，见 BUG-020 验收补充）。字面
+    标签样文本（如 <table>、<!-- -->、<?php ?>、<![CDATA[]]>、<采暖>）
+    转成实体，避免下游渲染器把它当作原始 HTML 处理：标签名首字符覆盖
+    非 ASCII（槽位语法的中文标签，见 BUG-048），仅排除空白首字符
+    （"a < b" 类普通比较文本不是标签样，保留裸形式维持可读性——
+    转义本身渲染无损，但会降低 md 源文件可读性）。
+    """
+    text = (text or "").replace("\\", "\\\\").replace("|", r"\|")
+    return re.sub(
+        r"<[^\s<>][^<>]*>",
+        lambda m: m.group(0).replace("<", "&lt;", 1).replace(">", "&gt;"),
+        text,
+    )
+
+
+def _escape_unescaped_pipes(text: str) -> str:
+    """对已处于最终转义层次的文本（嵌套表格产物）仅转义未受保护的管道。
+
+    管道前的连续反斜线为偶数条（含 0）说明这些反斜线都是转义产物、
+    管道本身未转义，需要补一条转义；奇数条说明管道已被转义，保持原样。
+    """
+    def _repl(match):
+        run = match.group(1)
+        if len(run) % 2:
+            return match.group(0)
+        return run + r"\|"
+
+    return re.sub(r"(\\*)\|", _repl, text)
+
+
 def _normalize_markdown_cell_text(value: str) -> str:
-    """将单元格内容规范化为 Markdown 管道表可安全呈现的单行文本。"""
-    text = unescape(value or "").replace("\xa0", " ")
+    """将原始纯文本单元格内容（Excel 路径）规范化为管道表单元格单行文本。
+
+    在统一最终序列化层执行：反斜线→\\\\、管道→\\|（顺序固定），字面
+    ASCII 标签转实体。不做 HTML unescape——Excel 单元格是纯文本。
+    """
+    text = (value or "").replace("\xa0", " ")
+    text = _escape_plain_cell_text(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
     lines = [line for line in lines if line]
-    text = "<br>".join(lines) if lines else ""
-    return text.replace("|", r"\|")
+    return "<br>".join(lines) if lines else ""
+
+
+def _serialize_table_cell(parts) -> str:
+    """将 HTML 表格单元格收集到的片段序列化为管道表单元格的单行最终文本。
+
+    纯文本片段（str）处于原始形态，整体应用 _escape_plain_cell_text；
+    嵌套表格产物（("nested", md) 元组）的文本已由内层序列化到最终转义
+    层次，仅对未受保护的管道补转义（内层结构管道），反斜线序列不再改动。
+    两类片段的转义规则互补，任何管道在进入最终 Markdown 时都恰好携带
+    一条有效转义，不产生双重转义或裸管道（见 BUG-020）。
+    """
+    out = []
+    for part in parts:
+        if isinstance(part, tuple):
+            out.append(_escape_unescaped_pipes(part[1]))
+        else:
+            out.append(_escape_plain_cell_text(part))
+    text = "".join(out)
+    text = text.replace("\xa0", " ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "<br>".join(lines) if lines else ""
 
 
 class _TableHTMLParser(HTMLParser):
-    """解析单个 HTML table，保留 rowspan/colspan 与单元格文本。"""
+    """解析单个 HTML table，保留 rowspan/colspan 与单元格文本。
+
+    单元格内的嵌套表格（<td> 中再含 <table>）先递归转换为 Markdown，
+    以 ("nested", md) 元组追加到单元格片段；纯文本片段为 str。两类片段
+    由 _serialize_table_cell 在统一的最终转义层次分别序列化。
+    """
 
     def __init__(self):
         super().__init__()
@@ -469,22 +875,47 @@ class _TableHTMLParser(HTMLParser):
         self._in_tr = False
         self._in_cell = False
         self._current_row = []
-        self._cell_parts = []
+        self._cell_parts = []  # str（原始文本/换行标记）或 ("nested", md)
         self._cell_tag = None
         self._cell_rowspan = 1
         self._cell_colspan = 1
+        # 嵌套表格原始 HTML 收集状态（0 表示未在收集）
+        self._nested_depth = 0
+        self._nested_parts = []
 
     @staticmethod
     def _safe_int(raw, default=1):
         try:
             value = int(raw)
             return value if value > 0 else default
+        except TimeoutError:
+            raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
         except Exception:
             return default
+
+    def _append_cell_newline(self):
+        """在单元格内补换行标记；末尾片段是嵌套产物时无条件补。"""
+        if self._cell_parts and isinstance(self._cell_parts[-1], str) \
+                and self._cell_parts[-1].endswith("\n"):
+            return
+        self._cell_parts.append("\n")
 
     def handle_starttag(self, tag, attrs):
         attrs_map = dict(attrs)
         tag = tag.lower()
+
+        if self._nested_depth:
+            # 收集嵌套表格的原始 HTML，交给递归转换处理。
+            if tag == "table":
+                self._nested_depth += 1
+            self._nested_parts.append(self.get_starttag_text() or f"<{tag}>")
+            return
+
+        if tag == "table" and self._in_cell:
+            self._nested_depth = 1
+            self._nested_parts = [self.get_starttag_text() or "<table>"]
+            return
+
         if tag == "tr":
             self._in_tr = True
             self._current_row = []
@@ -501,18 +932,35 @@ class _TableHTMLParser(HTMLParser):
         if self._in_cell and tag in ("br",):
             self._cell_parts.append("\n")
         elif self._in_cell and tag in ("p", "div", "li"):
-            if self._cell_parts and not self._cell_parts[-1].endswith("\n"):
-                self._cell_parts.append("\n")
+            self._append_cell_newline()
+
+    def handle_startendtag(self, tag, attrs):
+        if self._nested_depth:
+            self._nested_parts.append(self.get_starttag_text() or f"<{tag}/>")
+            return
+        super().handle_startendtag(tag, attrs)
 
     def handle_endtag(self, tag):
         tag = tag.lower()
+
+        if self._nested_depth:
+            self._nested_parts.append(f"</{tag}>")
+            if tag == "table":
+                self._nested_depth -= 1
+                if self._nested_depth == 0:
+                    nested_html = "".join(self._nested_parts)
+                    self._nested_parts = []
+                    nested_md = table_html_to_markdown(nested_html)
+                    if nested_md:
+                        self._cell_parts.append(("nested", nested_md))
+            return
+
         if tag in ("p", "div", "li") and self._in_cell:
-            if self._cell_parts and not self._cell_parts[-1].endswith("\n"):
-                self._cell_parts.append("\n")
+            self._append_cell_newline()
             return
 
         if tag in ("td", "th") and self._in_cell:
-            text = _normalize_markdown_cell_text("".join(self._cell_parts))
+            text = _serialize_table_cell(self._cell_parts)
             self._current_row.append(
                 {
                     "text": text,
@@ -535,8 +983,17 @@ class _TableHTMLParser(HTMLParser):
             self._current_row = []
 
     def handle_data(self, data):
+        if self._nested_depth:
+            # 嵌套收集按原始 HTML 语义重新序列化：HTMLParser 已把实体解码
+            # 成文本，必须重新转义，否则字面标签文本（如正文写的 <table>）
+            # 会在递归解析时被当作真实标签，导致整块内容丢失（见 BUG-020）。
+            self._nested_parts.append(_escape_html(data, quote=False))
+            return
         if self._in_cell:
-            self._cell_parts.append(data)
+            # 单元格文本保持实体形式，由 html_to_markdown 末尾的统一
+            # unescape 还原；提前解码会让字面标签文本被后续的 HTML
+            # 标签清理步骤删除。
+            self._cell_parts.append(_escape_html(data, quote=False))
 
 
 def _normalize_list_item_text(value: str) -> str:
@@ -651,13 +1108,17 @@ class _ListHTMLTransformer(HTMLParser):
         self._out.append(f"<{tag}{self._attrs_to_str(attrs)}/>")
 
     def handle_data(self, data):
+        # HTMLParser 已把实体解码成文本，重新转义保持实体形式，由
+        # html_to_markdown 末尾的统一 unescape 还原一次；否则字面标签
+        # 文本（如正文写的 <table>）会被后续的 HTML 标签清理步骤删除
+        # （见 BUG-020）。
         if self._li_stack:
-            self._li_stack[-1].append(data)
+            self._li_stack[-1].append(_escape_html(data, quote=False))
             return
         if self._list_stack:
             # 列表容器中但不在 li 内的噪声文本通常只有空白，忽略。
             return
-        self._out.append(data)
+        self._out.append(_escape_html(data, quote=False))
 
     def get_output(self):
         return "".join(self._out)
@@ -741,6 +1202,68 @@ def table_html_to_markdown(table_html: str) -> str:
     for row in rows[1:]:
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines) + "\n\n"
+
+
+_TABLE_TAG_RE = re.compile(r"</?table\b[^>]*>", re.IGNORECASE)
+
+# 匹配 <img src=...>，支持双引号、单引号、无引号三种写法；
+# 等号两侧的空白也要容忍（src= "a.png" 是合法 HTML，见 BUG-021）
+_IMG_TAG_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*"
+    r"(?:\"(?P<src1>[^\"]*)\"|'(?P<src2>[^']*)'|(?P<src3>[^\s\"'=<>`]+))"
+    r"[^>]*/?>",
+    flags=re.IGNORECASE,
+)
+
+
+def replace_html_tables(html: str) -> str:
+    """按配对标签转换所有 HTML 表格，支持表格嵌套。
+
+    非贪婪正则会在内层表格的 </table> 处提前截断，导致外层表格其余单元格
+    丢失。这里用深度计数定位每个顶层 <table>...</table>（含嵌套），整体交给
+    table_html_to_markdown 递归处理。
+    """
+    out = []
+    pos = 0
+    while True:
+        match = _TABLE_TAG_RE.search(html, pos)
+        if not match:
+            out.append(html[pos:])
+            break
+        if match.group(0).startswith("</"):
+            # 孤立的结束标签：原样保留，继续扫描
+            out.append(html[pos:match.end()])
+            pos = match.end()
+            continue
+
+        depth = 1
+        scan = match.end()
+        end = None
+        while depth > 0:
+            nxt = _TABLE_TAG_RE.search(html, scan)
+            if not nxt:
+                break
+            if nxt.group(0).startswith("</"):
+                depth -= 1
+                if depth == 0:
+                    end = nxt.end()
+                    break
+            else:
+                depth += 1
+            scan = nxt.end()
+
+        if end is None:
+            # 没有配对的 </table>（如文本里未配对的字面 <table> 标签）：
+            # 该标签按字面放行并继续扫描，不得把该位置到文末的内容整段
+            # 当作表格交给 table_html_to_markdown 吞掉（见 BUG-040）
+            out.append(html[pos:match.end()])
+            pos = match.end()
+            continue
+
+        out.append(html[pos:match.start()])
+        out.append(table_html_to_markdown(html[match.start():end]))
+        pos = end
+    return "".join(out)
 
 
 def promote_numbered_bold_headings(markdown: str) -> str:
@@ -900,22 +1423,35 @@ def extract_heading_level_map(docx_path: str) -> Dict[str, int]:
                 level = infer_level_from_text(text)
             if level is not None:
                 level_map[name] = level
+    except TimeoutError:
+        raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
     except Exception:
         return {}
 
     return level_map
 
 
-def resolve_part_path(target: str) -> str:
-    """将 relationship target 解析为 docx zip 内的规范路径（如 word/media/image1.png）"""
+def resolve_part_path(target: str, source_part: str = "word/document.xml") -> str:
+    """将 relationship target 解析为 docx zip 内的规范路径（normpath 归一）。
+
+      - 以 / 开头的是包根绝对路径（如 /custom/image1.png -> custom/image1.png）；
+      - 其余按 source_part 所在目录解析相对路径（如 word/document.xml 的
+        media/image1.png -> word/media/image1.png）；
+      - 兼容历史输入里已带 word/ 前缀的相对写法。
+
+    注意 Mammoth 实际读图并不归一（uri_to_zip_entry_name 只做字面拼接，
+    含 . / .. 段的条目两边口径不同，见 BUG-038）——配额统计等需要与
+    Mammoth 对齐的场景必须同时计入字面名与这里的规范名。
+    """
     target = (target or "").replace("\\", "/").strip()
     if not target:
         return ""
     if target.startswith("/"):
-        target = target[1:]
+        return posixpath.normpath(target[1:])
     if target.startswith("word/"):
         return posixpath.normpath(target)
-    return posixpath.normpath(posixpath.join("word", target))
+    base_dir = posixpath.dirname(source_part)
+    return posixpath.normpath(posixpath.join(base_dir, target))
 
 
 def parse_relationships(docx_path):
@@ -943,6 +1479,8 @@ def parse_relationships(docx_path):
                 rel_type = rel.get('Type', '').split('/')[-1]
                 target = rel.get('Target', '')
                 relationships[rid] = {'type': rel_type, 'target': target}
+        except TimeoutError:
+            raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
         except Exception as e:
             logger.warning("解析关系文件失败: %s", e)
             return excel_to_preview, preview_to_excel, ordered_pairs
@@ -977,6 +1515,8 @@ def parse_relationships(docx_path):
                         excel_to_preview[ole_target] = img_target
                         preview_to_excel[img_target] = ole_target
                         ordered_pairs.append((ole_target, img_target))
+        except TimeoutError:
+            raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
         except Exception:
             pass  # document.xml 解析失败不影响后续
 
@@ -1121,6 +1661,10 @@ def excel_to_markdown(xlsx_data):
 
     except DocxSecurityError:
         raise
+    except TimeoutError:
+        # 批处理 SIGALRM 的单文档超时必须继续上抛：被降级为“无表格”会把
+        # 超时文档误记为转换成功并写 sentinel（见 BUG-025）
+        raise
     except Exception as e:
         logger.warning("Excel转Markdown失败: %s", e)
         return None
@@ -1156,8 +1700,10 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
             "skip" 仅跳过该资源继续转换。
         skip_state: 可选的可变 dict 输出参数。传入时写入 skipped 与
             media_processed（配额内的媒体条目数）、allowed_media_paths
-            （提取与 Mammoth 回调共用的物理媒体白名单）；省略时保持
-            历史三项返回值契约。
+            （提取与 Mammoth 回调共用的物理媒体白名单）、media_part_names
+            （包内全部物理图片条目，含未引用的 word/media 及关系目标，
+            供 Mammoth 回调识别媒体路径）、empty_directory_parts（空目录
+            占位名，供回调排除伪图片）；省略时保持历史三项返回值契约。
             ZIP 级恶意特征不在此降级（validate 阶段已无条件拒绝）。
 
     返回:
@@ -1178,11 +1724,21 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
     excel_to_preview, preview_to_excel, ordered_pairs = parse_relationships(docx_path)
 
     with zipfile.ZipFile(docx_path, 'r') as zip_ref:
+        empty_directory_parts = {
+            info.filename for info in zip_ref.infolist()
+            if info.is_dir() and info.file_size == 0
+        }
         excel_md_by_path = {}
         table_preview_paths = set()
+        # 物理图片条目 = word/media/* ∪ 各 Mammoth 正文 part（动态解析，
+        # 见 _document_image_part_names）关系文件的 image 关系目标，保持
+        # ZIP 条目顺序（skip 配额按此顺序截取）。仅按目录前缀或硬编码
+        # part 清单枚举会被改写 Target 的文档绕过数量/大小/像素防线
+        # （见 BUG-026/BUG-042）。
+        image_part_names = _document_image_part_names(zip_ref)
         media_paths = [
             info.filename for info in zip_ref.filelist
-            if info.filename.startswith('word/media/') and not info.is_dir()
+            if info.filename in image_part_names
         ]
         allowed_media_paths = set(media_paths)
         if skip_mode:
@@ -1190,11 +1746,11 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
             media_processed = len(allowed_media_paths)
             if len(media_paths) > limits["image_count"]:
                 skipped.append((
-                    "word/media/*",
+                    "图片条目*",
                     f"图片数量超过上限 {limits['image_count']}，剩余图片停止提取",
                 ))
                 logger.warning(
-                    "图片数量超过上限 %d，配额外 word/media 图片不会读取",
+                    "图片数量超过上限 %d，配额外图片条目不会读取",
                     limits["image_count"],
                 )
 
@@ -1244,10 +1800,11 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
             table_repeat_by_hash[digest] = table_md
             logger.info("转换Excel为表格: %s", excel_path)
 
-        # 处理图片（显式目录 entry 不算图片，否则会写出空 assets/.png 并错占配额）
+        # 处理图片（关系目标可能位于 word/media 之外的任意包内路径）
         for file_info in zip_ref.filelist:
-            if file_info.filename.startswith('word/media/') and not file_info.is_dir():
-                image_name = os.path.basename(file_info.filename)
+            if file_info.filename in image_part_names:
+                # 目录名条目（word/media/image1.png/）去掉尾 / 取文件名
+                image_name = os.path.basename(file_info.filename.rstrip("/"))
 
                 # 检查这个图片是否是Excel的预览图
                 if file_info.filename in table_preview_paths:
@@ -1272,24 +1829,19 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
                 original_ext = os.path.splitext(image_name)[1].lower()
                 actual_ext = detect_image_format(image_data) or original_ext or ".png"
                 base_name = os.path.splitext(image_name)[0]
-                corrected_name = f"{base_name}{actual_ext}"
-                
-                image_path = os.path.join(assets_dir, corrected_name)
-                # 扩展名修正后可能与已有文件同名，若内容不同则附加hash后缀避免覆盖
-                if os.path.exists(image_path):
-                    try:
-                        with open(image_path, "rb") as f:
-                            existing = f.read()
-                        if existing != image_data:
-                            corrected_name = f"{base_name}_{digest[:8]}{actual_ext}"
-                            image_path = os.path.join(assets_dir, corrected_name)
-                    except Exception:
-                        corrected_name = f"{base_name}_{digest[:8]}{actual_ext}"
-                        image_path = os.path.join(assets_dir, corrected_name)
 
-                if not os.path.exists(image_path):
-                    with open(image_path, 'wb') as f:
-                        f.write(image_data)
+                # 候选路径循环分配：只有普通文件且字节一致才复用；符号链接
+                # （含悬空）、目录或不同内容的占用继续换名，避免跟随链接写
+                # 入外部或引用错误文件（见 BUG-023/BUG-027）。分配与独占
+                # 写入之间被第三方占用的候选同样换名重试（见 BUG-047）。
+                while True:
+                    corrected_name, image_path = _allocate_asset_path(
+                        assets_dir, base_name, actual_ext, digest, image_data)
+                    try:
+                        _write_asset_file_exclusive(image_path, image_data)
+                        break
+                    except FileExistsError:
+                        continue
 
                 image_by_hash.setdefault(digest, f"assets/{corrected_name}")
                 logger.info("提取图片: %s", corrected_name)
@@ -1300,6 +1852,8 @@ def extract_content_from_docx(docx_path, assets_dir, on_limit="reject", skip_sta
             "skipped": skipped,
             "media_processed": media_processed,
             "allowed_media_paths": allowed_media_paths,
+            "media_part_names": image_part_names,
+            "empty_directory_parts": empty_directory_parts,
         })
     return image_by_hash, table_queue_by_hash, table_repeat_by_hash
 
@@ -1332,6 +1886,8 @@ def extract_textbox_content(docx_path: str) -> List[str]:
                         paras.append(text)
                 if paras:
                     blocks.append("\n".join(paras))
+    except TimeoutError:
+        raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
     except Exception:
         pass
     return blocks
@@ -1371,6 +1927,8 @@ def extract_math_text(docx_path: str) -> List[str]:
                     formulas.append(text)
                 for child in node.iter(tag_omath):
                     seen.add(id(child))
+    except TimeoutError:
+        raise  # 超时信号不得被降级捕获吞掉（见 BUG-025）
     except Exception:
         pass
     return formulas
@@ -1433,15 +1991,36 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
         final_output_dir = os.path.join(output_dir, folder_name)
     else:
         final_output_dir = output_dir
-    
-    # 创建输出目录
-    os.makedirs(final_output_dir, exist_ok=True)
+
+    # 输出写入边界（见 BUG-019）：文档输出子目录必须是普通目录，不允许
+    # 符号链接——否则预置链接会把 assets 清理、Markdown 与 sentinel 写入
+    # 导向输出目录之外，prune_stale_assets 甚至会删除外部文件。最终真实
+    # 路径还须仍位于输出根目录内（防御中间组件被替换为链接）。
+    # 目录状态一律用 _path_status 直接 lstat：os.path.lexists/islink/isdir
+    # 内部捕获 OSError（含 TimeoutError），会吞掉批处理超时信号（见 BUG-035）。
+    if create_subfolder:
+        st = _path_status(final_output_dir)
+        if st is not None and not stat.S_ISDIR(st.st_mode):
+            raise ValueError(
+                f"输出子目录已存在且不是普通目录（不允许符号链接）: {final_output_dir}")
+    # realpath 一律走 _safe_realpath：os.path.realpath 非 strict 模式
+    # 内部 except OSError 会吞掉组件 lstat 的 TimeoutError（见 BUG-039）
+    output_root_real = _safe_realpath(output_dir)
+    final_real = _safe_realpath(final_output_dir)
+    if os.path.commonpath([output_root_real, final_real]) != output_root_real:
+        raise ValueError(
+            f"输出目录解析后的真实路径越出输出根目录: {final_output_dir} -> {final_real}")
+
+    # 创建输出目录：仅在缺失时调用 makedirs，避免其 exist_ok 兜底里的
+    # isdir 吞掉超时信号（见 BUG-035）
+    if _path_status(final_output_dir) is None:
+        os.makedirs(final_output_dir)
     assets_dir = os.path.join(final_output_dir, 'assets')
-    if os.path.lexists(assets_dir) and (
-        os.path.islink(assets_dir) or not os.path.isdir(assets_dir)
-    ):
+    st = _path_status(assets_dir)
+    if st is not None and not stat.S_ISDIR(st.st_mode):
         raise ValueError(f"assets 目录必须是普通目录（不允许符号链接）: {assets_dir}")
-    os.makedirs(assets_dir, exist_ok=True)
+    if st is None:
+        os.makedirs(assets_dir)
     
     # 提取图片和Excel表格
     logger.info("正在提取内容...")
@@ -1453,9 +2032,16 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
     # Mammoth 回调必须复用 ZIP 提取阶段选定的同一份物理媒体
     # 白名单，不能按回调顺序重新分配配额，否则可落盘 2x 上限。
     allowed_media_paths = set(skip_state["allowed_media_paths"])
+    media_part_names = set(skip_state["media_part_names"])
+    empty_directory_parts = set(skip_state["empty_directory_parts"])
     media_quota_exceeded = any(
         "图片数量超过上限" in reason for _, reason in skipped_resources
     )
+    # Mammoth 回调兜底写盘的剩余配额：扫描侧已确认的物理图片之外的未知
+    # 图片（zip 条目与回调数据不一致、或动态解析口径与 mammoth 实际读取
+    # 出现偏差时）也不得使总数突破 image_count（见 BUG-042 fail-closed）。
+    fallback_image_budget = [
+        DOCX_SECURITY_LIMITS["image_count"] - len(allowed_media_paths)]
     noted_skipped = set()
     if any("图片数量超过上限" in reason for _, reason in skipped_resources):
         # 提取阶段已用一条记录汇总“剩余图片”；Mammoth 仍会
@@ -1480,29 +2066,41 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
 
     def convert_image(image):
         """根据图片内容hash，返回对应的assets路径或表格占位符"""
+        # 空目录不是图片：两种策略均在配额判断及回调读取前排除，防止
+        # 已被扫描排除的目录经兜底写盘复活（见 BUG-049）。
+        if _mammoth_embedded_media_key(image, empty_directory_parts) is not None:
+            return _skipped_image_result("directory", b"")
         if skip_mode:
-            media_key = _mammoth_embedded_media_key(image)
+            media_key = _mammoth_embedded_media_key(image, media_part_names)
             if media_key is not None and media_key not in allowed_media_paths:
                 return _skipped_image_result("count", b"")
             if media_key is None and media_quota_exceeded:
                 # Mammoth 版本/图片类型无法暴露物理路径时选择安全回退：
                 # 不在已确认超配额的文档中允许未知回调兜底落盘。
                 return _skipped_image_result("count", b"")
-            # skip 模式下回调读取同样有界，并复用提取阶段的大小/像素防线：
-            # 已跳过的超限图片不会出现在 image_by_hash，若放行到下方兜底
-            # 写盘分支即绕过防线，故超限在此直接返回可见跳过占位
-            with image.open() as image_bytes:
-                image_data = image_bytes.read(DOCX_SECURITY_LIMITS["image_file_size"] + 1)
-            if len(image_data) > DOCX_SECURITY_LIMITS["image_file_size"]:
+
+        # 两种策略的回调读取都执行大小/像素防线：reject 直接整篇拒绝；
+        # skip 模式下已跳过的超限图片不会出现在 image_by_hash，若放行到
+        # 下方兜底写盘分支即绕过防线，故超限直接返回可见跳过占位（见
+        # BUG-026：reject 回调此前无界 read 且不检查像素）。
+        with image.open() as image_bytes:
+            image_data = image_bytes.read(DOCX_SECURITY_LIMITS["image_file_size"] + 1)
+        if len(image_data) > DOCX_SECURITY_LIMITS["image_file_size"]:
+            if skip_mode:
                 return _skipped_image_result("size", image_data)
-            pixels = image_pixel_count(image_data)
-            if pixels is not None and pixels > DOCX_SECURITY_LIMITS["image_pixels"]:
+            raise ResourceLimitExceeded(
+                "图片超过单图大小上限 "
+                f"{_fmt_bytes(DOCX_SECURITY_LIMITS['image_file_size'])}: mammoth 回调"
+            )
+        pixels = image_pixel_count(image_data)
+        if pixels is not None and pixels > DOCX_SECURITY_LIMITS["image_pixels"]:
+            if skip_mode:
                 return _skipped_image_result("pixels", image_data)
-            digest = hashlib.sha256(image_data).hexdigest()
-        else:
-            with image.open() as image_bytes:
-                image_data = image_bytes.read()
-            digest = hashlib.sha256(image_data).hexdigest()
+            raise ResourceLimitExceeded(
+                f"图片像素超过上限 {DOCX_SECURITY_LIMITS['image_pixels']}: "
+                f"mammoth 回调（{pixels} 像素）"
+            )
+        digest = hashlib.sha256(image_data).hexdigest()
 
         table_queue = table_queue_by_hash.get(digest)
         if table_queue:
@@ -1527,7 +2125,17 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
         if image_src:
             return {"src": image_src}
 
-        # 兜底：某些情况下zip里的图片与mammoth回调数据不一致，直接按hash写入assets
+        # 兜底：某些情况下zip里的图片与mammoth回调数据不一致，直接按hash写入assets。
+        # 候选分配与提取循环同一套规则（见 BUG-027）
+        if fallback_image_budget[0] <= 0:
+            # 扫描侧未见过的图片也不得使总数突破上限（见 BUG-042）
+            if skip_mode:
+                return _skipped_image_result("count", b"")
+            raise ResourceLimitExceeded(
+                "图片数量超过上限 "
+                f"{DOCX_SECURITY_LIMITS['image_count']}: mammoth 回调兜底"
+            )
+        fallback_image_budget[0] -= 1
         ext = detect_image_format(image_data)
         if not ext:
             # 依据 mammoth 提供的 content_type 推断扩展名，仍未知则保留二进制原名
@@ -1537,11 +2145,15 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
                 "webp": ".webp", "bmp": ".bmp", "tiff": ".tiff",
                 "x-wmf": ".wmf", "x-emf": ".emf",
             }.get(content_subtype, ".bin")
-        filename = f"image_{digest[:16]}{ext}"
-        image_path = os.path.join(assets_dir, filename)
-        if not os.path.exists(image_path):
-            with open(image_path, "wb") as f:
-                f.write(image_data)
+        # 分配与独占写入之间被第三方占用的候选换名重试（见 BUG-047）
+        while True:
+            filename, image_path = _allocate_asset_path(
+                assets_dir, f"image_{digest[:16]}", ext, digest, image_data)
+            try:
+                _write_asset_file_exclusive(image_path, image_data)
+                break
+            except FileExistsError:
+                continue
         image_by_hash[digest] = f"assets/{filename}"
         return {"src": f"assets/{filename}"}
     
@@ -1570,7 +2182,7 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
     if leftover:
         logger.warning("有 %d 个表格占位符未能替换为表格（请检查输出）", len(leftover))
 
-    # 将 on_limit=skip 跳过的超限图片占位替换为可见说明
+    # 将 on_limit=skip 的超限图片、两种策略的空目录占位替换为可见说明
     # （不引用不存在的资源文件，跳过在输出中可见、可审计）
     markdown = re.sub(
         r"!\[[^\]]*\]\(__SKIPPED_IMAGE_([a-z]+)__\)",
@@ -1588,12 +2200,19 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
     # 追加 mammoth 未能提取的文本框内容
     textbox_blocks = extract_textbox_content(docx_path)
     if textbox_blocks:
-        # 检查主体中是否已包含文本框文本（mammoth 有时也能提取部分文本框）
-        missing = [b for b in textbox_blocks if b.splitlines()[0] not in markdown]
+        # 检查主体中是否已包含文本框文本（mammoth 有时也能提取部分文本框）；
+        # 主体经实体保护管线后以实体形式存在，两种形式都查避免重复追加
+        def _already_in_markdown(line: str) -> bool:
+            return line in markdown or _escape_html(line, quote=False) in markdown
+
+        missing = [b for b in textbox_blocks if not _already_in_markdown(b.splitlines()[0])]
         if missing:
             markdown += "\n\n---\n\n> **\\[文本框内容\\]**\n\n"
             for block in missing:
-                markdown += f"> {block}\n>\n"
+                # 文本框内容在此拼接，已绕过 html_to_markdown 的实体保护
+                # 管线：字面 <time>/<table> 等必须实体化，否则渲染时被当作
+                # 原始 HTML 吞掉显示（见 BUG-046，处理方式与脚注体一致）
+                markdown += f"> {_escape_html(block, quote=False)}\n>\n"
             logger.info("追加了 %d 个文本框内容", len(missing))
 
     # 追加 mammoth 未能提取的数学公式
@@ -1608,8 +2227,9 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
 
     md_path = os.path.join(final_output_dir, f"{folder_name}.md")
 
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write(markdown)
+    # 随机独占临时文件 + 原子替换：目标位置的预置符号链接只被替换目录项，
+    # 不会被跟随写入外部文件（见 BUG-023）
+    _atomic_write_text(md_path, markdown)
 
     # 子目录模式的 assets 归当前文档独占，可清理旧产物。
     # 平铺模式可能由多份 Markdown 共享 assets，不删除未引用文件。
@@ -1628,33 +2248,92 @@ def convert_docx_to_markdown(docx_path, output_dir, create_subfolder=True, outpu
     return md_path
 
 
+class _FootnoteHTMLParser(HTMLParser):
+    """按 li 嵌套深度提取完整脚注，仅记录需从原文删除的区间。"""
+
+    def __init__(self, source: str):
+        super().__init__(convert_charrefs=True)
+        self.source = source
+        self.line_offsets = [0] + [match.end() for match in re.finditer("\n", source)]
+        self.footnote_bodies: Dict[str, str] = {}
+        self.spans: List[Tuple[int, int]] = []
+        self.fid: Optional[str] = None
+        self.li_depth = 0
+        self.start = 0
+        self.body: List[str] = []
+
+    def _source_offset(self) -> int:
+        line, column = self.getpos()
+        return self.line_offsets[line - 1] + column
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if self.fid is None:
+            fid = re.fullmatch(r"footnote-(\d+)", attrs.get("id") or "", flags=re.IGNORECASE)
+            if tag != "li" or not fid:
+                return
+            self.fid = fid.group(1)
+            self.li_depth = 1
+            self.start = self._source_offset()
+            self.body = []
+            return
+
+        if tag == "li":
+            self.li_depth += 1
+        if tag in {"p", "div", "li", "ul", "ol", "br"}:
+            self.body.append(" ")
+        elif tag == "img" and attrs.get("src") is not None:
+            # 和数据节点一样保护实体，避免路径被后续 HTML 管线重新解释。
+            self.body.append(_escape_html(f"![]({attrs['src']})", quote=False))
+
+    def handle_data(self, data):
+        if self.fid is not None:
+            # HTMLParser 已解码实体；重新转义以保留字面 <time>/<table>，
+            # 由 html_to_markdown 的最终实体保护管线统一处理（BUG-031）。
+            self.body.append(_escape_html(data, quote=False))
+
+    def handle_endtag(self, tag):
+        if self.fid is None:
+            return
+        if tag in {"p", "div", "li", "ul", "ol"}:
+            self.body.append(" ")
+        if tag != "li":
+            return
+        self.li_depth -= 1
+        if self.li_depth:
+            return
+
+        # 空白来自原文本、字符实体或块级边界，统一压成单行定义（BUG-032）。
+        body = _WHITESPACE_RE.sub(" ", "".join(self.body).replace("↑", "")).strip()
+        if body:
+            self.footnote_bodies[self.fid] = body
+        end = self.source.index(">", self._source_offset()) + 1
+        self.spans.append((self.start, end))
+        self.fid = None
+
+
 def _convert_footnotes(html: str) -> str:
     """将 mammoth 生成的脚注 HTML 转换为 Markdown 脚注语法。
 
     mammoth 输出格式：
       正文引用: <sup><a href="#footnote-N" id="footnote-ref-N">[N]</a></sup>
       文末列表: <li id="footnote-N"><p>text <a href="#footnote-ref-N">↑</a></p></li>
+
+    脚注体在其余 HTML 转换之前按完整 li 节点抽出，支持内部嵌套列表。
+    图片收成内联 Markdown，skip 占位沿用正文替换；文本实体保留到
+    管线末尾，全部空白归一化，使图片与正文都保持在 [^N]: 同一行。
     """
-    footnote_bodies: Dict[str, str] = {}
-
-    def _extract_footnote_body(match):
-        fid = match.group("fid")
-        body_html = match.group("body")
-        body_html = re.sub(r"</(?:p|div|li|br)\s*/?>", " ", body_html, flags=re.IGNORECASE)
-        body = re.sub(r"<[^>]+>", "", body_html, flags=re.DOTALL)
-        body = unescape(body).replace("↑", "").strip()
-        body = re.sub(r"  +", " ", body)
-        if body:
-            footnote_bodies[fid] = body
-        return ""
-
-    html = re.sub(
-        r'<li\b[^>]*\bid\s*=\s*["\']?footnote-(?P<fid>\d+)["\']?[^>]*>'
-        r"(?P<body>.*?)</li>",
-        _extract_footnote_body,
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    parser = _FootnoteHTMLParser(html)
+    parser.feed(html)
+    parser.close()
+    footnote_bodies = parser.footnote_bodies
+    parts = []
+    cursor = 0
+    for start, end in parser.spans:
+        parts.append(html[cursor:start])
+        cursor = end
+    parts.append(html[cursor:])
+    html = "".join(parts)
 
     html = re.sub(
         r"<sup>\s*<a\b[^>]*href\s*=\s*[\"']?#footnote-(\d+)[\"']?[^>]*>"
@@ -1698,6 +2377,11 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
             text = unescape(text).strip()
             if not text:
                 return ""
+            # unescape 会把标题里的字面标签文本（&lt;table&gt; 等）还原成
+            # 裸标签：裸 <table> 会被表格转换吞掉其后全部内容（见 BUG-040），
+            # <a>/<time> 等会被当作真实标签删除或改写成链接（见 BUG-044）。
+            # 重新实体化，由管线末尾的实体保护还原为可见的字面文本。
+            text = text.replace("<", "&lt;").replace(">", "&gt;")
             return f"{'#' * level} {text}\n\n"
 
         html = re.sub(
@@ -1717,26 +2401,16 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     html = re.sub(r'<em>(.*?)</em>', r'*\1*', html, flags=re.DOTALL)
     html = re.sub(r'<i>(.*?)</i>', r'*\1*', html, flags=re.DOTALL)
     
-    # 处理图片
-    def _replace_img(match):
+    def _img_markdown(match):
         src = match.group("src1") or match.group("src2") or match.group("src3") or ""
-        return f"![]({src})\n\n"
+        return f"![]({src})"
 
-    html = re.sub(
-        (
-            r"<img\b[^>]*\bsrc\s*=\s*"
-            r"(?:\"(?P<src1>[^\"]*)\"|'(?P<src2>[^']*)'|(?P<src3>[^\s\"'=<>`]+))"
-            r"[^>]*/?>"
-        ),
-        _replace_img,
-        html,
-        flags=re.IGNORECASE,
-    )
-    
-    # 处理链接（支持双引号、单引号、无引号三种 href 写法）
+    # 处理链接（支持双引号、单引号、无引号三种 href 写法）。
+    # 先于图片处理：链接内的图片用内联语法就地替换，避免图片自带的块级换行
+    # 落在 `[` 与 `](url)` 之间，把链接语法拆断成非法 Markdown。
     def _replace_link(match):
         href = match.group("href1") or match.group("href2") or match.group("href3") or ""
-        text = match.group("text")
+        text = _IMG_TAG_RE.sub(_img_markdown, match.group("text"))
         return f"[{text}]({href})"
 
     html = re.sub(
@@ -1750,16 +2424,14 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
         flags=re.DOTALL | re.IGNORECASE,
     )
 
+    # 处理链接之外的图片（块级语法，保持既有排版）
+    html = _IMG_TAG_RE.sub(lambda match: _img_markdown(match) + "\n\n", html)
+
     # 先把HTML里的换行标签转为文本换行（需早于表格转换，避免改写表格里的 <br> 文本）
     html = re.sub(r'<br\s*/?>', '\n', html)
 
-    # 先处理表格（必须在段落/列表转换之前）
-    html = re.sub(
-        r'<table[^>]*>.*?</table>',
-        lambda match: table_html_to_markdown(match.group(0)),
-        html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    # 先处理表格（必须在段落/列表转换之前）；按配对标签匹配以支持嵌套表格
+    html = replace_html_tables(html)
 
     # 使用结构化解析处理列表，避免正则顺序导致的嵌套层级破坏。
     html = transform_html_lists_to_markdown(html)
@@ -1774,7 +2446,18 @@ def html_to_markdown(html, heading_level_map: Optional[Dict[str, int]] = None):
     html = re.sub(r'\n{3,}', '\n\n', html)
     
     html = html.replace('&nbsp;', ' ')
+    # 统一 unescape 前保护“实体形式的标签样文本”（如 &lt;table&gt;、&lt;time&gt;、
+    # &lt;采暖&gt;）：还原成裸 <...> 会被 Python Markdown 当作原始 HTML，
+    # PDF 渲染时槽位文字不可见；标记后在 unescape 后恢复为实体，渲染为
+    # 可见字面文本。首字符覆盖 /!?（<!-- -->、<? ?>、<![CDATA[]]> 等，
+    # 见 BUG-045）与非 ASCII（中文槽位标签，见 BUG-048），仅排除空白
+    # 首字符（"a < b" 类普通比较文本不是标签样，unescape 后保持裸形式
+    # 维持 md 源文件可读性）；真正需要透传的 <br>（单元格换行）与
+    # mammoth 的 sup/sub 等原始标签不在实体形式，不受影响
+    # （见 BUG-020 验收补充）。
+    html = re.sub(r"&lt;([^\s\x00\x01][^\x00\x01]*?)&gt;", "\x00\\1\x01", html)
     html = unescape(html)
+    html = html.replace("\x00", "&lt;").replace("\x01", "&gt;")
 
     html = promote_numbered_bold_headings(html)
     html = promote_leading_bold_title(html)
